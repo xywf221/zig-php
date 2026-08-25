@@ -1,0 +1,14 @@
+.{
+    .name = .zphp,
+    .version = "0.1.0",
+    .fingerprint = 0x8c166727694c5a28,
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "README.md",
+        "src",
+        "examples",
+    },
+}
