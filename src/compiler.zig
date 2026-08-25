@@ -77,7 +77,11 @@ pub const Compiler = struct {
         // Top-level unit.
         const main_func = try arena.create(Func);
         main_func.* = .{ .name = "<main>", .arity = 0 };
-        var main_ctx = FnCtx{ .func = main_func, .is_global_scope = true };
+        // Top-level variables live in the main frame's slots rather than the
+        // globals map: PHP scoping keeps them invisible to functions anyway
+        // (no \ keyword in the minimal core), and slot access avoids
+        // a hash lookup per variable operation in hot loops.
+        var main_ctx = FnCtx{ .func = main_func, .is_global_scope = false };
         {
             var c = Compiler{ .arena = arena, .diag = diag, .ctx = &main_ctx, .chunk = &main_func.chunk };
             try c.compileStmts(prog_ast);

@@ -74,10 +74,12 @@ pub const Vm = struct {
     /// Execute the program (main function) to completion.
     pub fn run(self: *Vm) Error!void {
         const mainf = self.program.main_func;
+        const main_locals = try self.arena.alloc(Value, mainf.nlocals);
+        for (main_locals) |*l| l.* = .null_;
         try self.frames.append(self.arena, .{
             .func = mainf,
             .ip = 0,
-            .locals = &.{},
+            .locals = main_locals,
             .temps = try self.arena.alloc(Value, mainf.ntemps),
             .stack_base = 0,
         });

@@ -84,12 +84,13 @@ ReleaseFast 下与 PHP 8.5 (OPcache) 的对比（Windows, min of 5）：
 | workload | zphp | php | 比率 |
 |---|---|---|---|
 | fib(27) 递归 | 101ms | 95ms | **1.1x** |
-| 3000 万次循环累加 | 3793ms | 465ms | 8.2x* |
-| 50 万次数组追加 + foreach | 144ms | 97ms | 1.5x |
+| 3000 万次循环累加 | 2168ms | 492ms | 4.4x* |
+| 50 万次数组追加 + foreach | 94ms | 98ms | **1.0x** |
 | 10 万次字符串拼接 | 978ms | 81ms | 12.1x |
 
-\\* 循环差距来自 PHP 语义约束：顶层变量存放在全局哈希表中（函数内局部
-slot 则很快），后续可用局部提升优化。详见 [BENCHMARKS.md](BENCHMARKS.md)。
+\\* 循环剩余差距为逐指令派发开销（栈式机器 vs PHP 的专用 handler），
+可通过指令融合（fused get/add/set）继续缩小。顶层变量已提升为主帧
+局部 slot，数组操作已与 PHP 持平。详见 [BENCHMARKS.md](BENCHMARKS.md)。
 
 ## 架构
 
