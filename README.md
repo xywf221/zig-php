@@ -23,6 +23,8 @@ $ zphp fib.php
 - **寄存器字节码编译器 + 虚拟机**（三地址码，Lua/Dalvik 风格）
 - 值系统：null / bool / int / float / string / array（有序字典 + 哈希索引）/
   object（类、继承、属性、方法）/ 异常（Exception 类层次）
+- **16 字节紧凑值表示**（Zend zval 风格）：字符串装箱为堆上头对象，
+  寄存器文件与调用帧内存流量降低 1/3
 - **面向对象子集**：class、extends、属性默认值、`__construct`、`$this`、
   `->prop` / `->method()`、动态属性、`instanceof`、`get_class()`
 - **异常**：`throw` / `try` / 多子句 `catch (A|B $e)`，内置 Exception/Error

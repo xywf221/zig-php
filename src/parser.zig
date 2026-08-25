@@ -835,10 +835,12 @@ pub const Parser = struct {
             .int => .{ .int_ = try self.parseIntToken(t) },
             .float => .{ .float_ = try self.parseFloatToken(t) },
             .string => blk: {
-                if (t.single_quoted) {
-                    break :blk valmod.Value{ .str_ = try unescapeSingleQuoted(self.arena, t.text) };
-                }
-                break :blk valmod.Value{ .str_ = t.text }; // no interpolation in defaults
+                const text = if (t.single_quoted)
+                    try unescapeSingleQuoted(self.arena, t.text)
+                else
+                    t.text; // no interpolation in defaults
+                const boxed = try valmod.newStr(self.arena, text);
+                break :blk valmod.Value{ .str_ = boxed };
             },
             .kw_true => .{ .bool_ = true },
             .kw_false => .{ .bool_ = false },

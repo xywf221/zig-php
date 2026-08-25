@@ -187,9 +187,10 @@ pub const Vm = struct {
                 .inline_arg => {}, // data word
 
                 .declare_func => {
-                    const cf = self.program.funcs.get(consts[ins.a].str_) orelse
+                    const fname = consts[ins.a].str_.data;
+                    const cf = self.program.funcs.get(fname) orelse
                         return self.fatalF(line, "internal: uncompiled function", .{});
-                    try self.funcs.put(self.arena, consts[ins.a].str_, cf);
+                    try self.funcs.put(self.arena, fname, cf);
                 },
 
                 .new_array => regs[ins.a] = .{ .array_ = try Value.Array.create(self.arena) },
@@ -215,7 +216,7 @@ pub const Vm = struct {
                             const found = arr.get(try valmod.makeKey(key_v, self.arena)) orelse break :blk false;
                             break :blk found != .null_;
                         },
-                        .str_ => |st| key_v == .int_ and key_v.int_ >= 0 and key_v.int_ < st.len,
+                        .str_ => |st| key_v == .int_ and key_v.int_ >= 0 and key_v.int_ < st.data.len,
                         else => false,
                     } };
                 },
@@ -271,7 +272,8 @@ pub const Vm = struct {
                         .str_, .rope_ => .{ .rope_ = try valmod.Rope.cons(self.arena, l, r) },
                         else => blk: {
                             const ls = try valmod.toString(l, self.arena);
-                            break :blk .{ .str_ = try std.mem.concat(self.arena, u8, &.{ ls, r }) };
+                            const joined = try std.mem.concat(self.arena, u8, &.{ ls, r });
+                            break :blk .{ .str_ = try valmod.newStr(self.arena, joined) };
                         },
                     };
                 },
@@ -315,11 +317,11 @@ pub const Vm = struct {
                 },
                 .is_not_null => regs[ins.a] = .{ .bool_ = regs[ins.b] != .null_ },
                 .declare_class => {
-                    const name = consts[ins.a].str_;
+                    const name = consts[ins.a].str_.data;
                     self.declared_classes.put(self.arena, name, {}) catch {};
                 },
                 .new_obj => {
-                    const cls_name = consts[ins.c].str_;
+                    const cls_name = consts[ins.c].str_.data;
                     // Builtin exception classes: synthesize message/code/line.
                     if (self.program.classes.get(cls_name) == null and isBuiltinException(cls_name)) {
                         const msg: []const u8 = if (ins.a > 0)
@@ -362,7 +364,7 @@ pub const Vm = struct {
                 .get_prop => {
                     const o = regs[ins.b];
                     if (o != .obj_) return self.fatalF(line, "attempt to read property on {s}", .{o.typeName()});
-                    const name = consts[ins.c].str_;
+                    const name = consts[ins.c].str_.data;
                     regs[ins.a] = o.obj_.get(name) orelse blk: {
                         self.warn(line, "Undefined property: {s}::${s}", .{ o.obj_.class_name, name });
                         break :blk .null_;
@@ -371,12 +373,12 @@ pub const Vm = struct {
                 .set_prop => {
                     const o = regs[ins.a];
                     if (o != .obj_) return self.fatalF(line, "attempt to assign property on {s}", .{o.typeName()});
-                    try o.obj_.set(self.arena, consts[ins.b].str_, regs[ins.c]);
+                    try o.obj_.set(self.arena, consts[ins.b].str_.data, regs[ins.c]);
                 },
                 .call_method => {
                     const obj_val = f.regs[ins.b];
                     if (obj_val != .obj_) return self.fatalF(line, "call to member function on {s}", .{obj_val.typeName()});
-                    const mname0 = consts[ins.c].str_;
+                    const mname0 = consts[ins.c].str_.data;
                     // Builtin exception accessors.
                     if (isBuiltinException(obj_val.obj_.class_name)) {
                         if (std.mem.eql(u8, mname0, "getMessage")) {
@@ -395,7 +397,7 @@ pub const Vm = struct {
                     const cls_name = obj_val.obj_.class_name;
                     const info = self.program.classes.get(cls_name) orelse
                         return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
-                    const mname = consts[ins.c].str_;
+                    const mname = consts[ins.c].str_.data;
                     const mf = info.findMethod(mname) orelse
                         return self.fatalF(line, "Call to undefined method {s}::{s}()", .{ cls_name, mname });
                     // mf(this at slot 0, params at 1..): instance in regs[b],
@@ -404,14 +406,14 @@ pub const Vm = struct {
                 },
                 .instanceof => {
                     const o = regs[ins.b];
-                    const target = consts[ins.c].str_;
+                    const target = consts[ins.c].str_.data;
                     regs[ins.a] = .{ .bool_ = o == .obj_ and self.classExtends(o.obj_.class_name, target) };
                 },
                 .prop_pre_inc, .prop_pre_dec => {
                     const up = ins.op == .prop_pre_inc;
                     const o = regs[ins.b];
                     if (o != .obj_) return self.fatalF(line, "attempt to modify property on {s}", .{o.typeName()});
-                    const k = consts[ins.c].str_;
+                    const k = consts[ins.c].str_.data;
                     const old = o.obj_.get(k) orelse .null_;
                     const nv = incValue(old, up, self.arena);
                     try o.obj_.set(self.arena, k, nv);
@@ -421,7 +423,7 @@ pub const Vm = struct {
                     const up = ins.op == .prop_post_inc;
                     const o = regs[ins.b];
                     if (o != .obj_) return self.fatalF(line, "attempt to modify property on {s}", .{o.typeName()});
-                    const k = consts[ins.c].str_;
+                    const k = consts[ins.c].str_.data;
                     const old = o.obj_.get(k) orelse .null_;
                     const nv = incValue(old, up, self.arena);
                     try o.obj_.set(self.arena, k, nv);
@@ -464,7 +466,7 @@ pub const Vm = struct {
                     self.pending_ex = null;
                 },
                 .warn_undef => {
-                    const name = f.func.chunk.consts.items[ins.a].str_;
+                    const name = f.func.chunk.consts.items[ins.a].str_.data;
                     self.warn(line, "Undefined variable ${s}", .{name});
                 },
                 .coalesce => regs[ins.a] = if (regs[ins.b] != .null_) regs[ins.b] else regs[ins.c],
@@ -476,7 +478,7 @@ pub const Vm = struct {
                     for (regs[base .. base + n]) |v| {
                         try buf.appendSlice(self.arena, try valmod.toString(v, self.arena));
                     }
-                    regs[ins.a] = .{ .str_ = buf.items };
+                    regs[ins.a] = .{ .str_ = try valmod.newStr(self.arena, buf.items) };
                 },
                 .echo => {
                     const base = ins.a;
@@ -518,7 +520,7 @@ pub const Vm = struct {
 
                 .call => {
                     // a = argc, b = args base register, c = name const index
-                    try self.doCall(consts[ins.c].str_, ins.a, ins.b, line);
+                    try self.doCall(consts[ins.c].str_.data, ins.a, ins.b, line);
                     return; // re-derive frame in dispatch()
                 },
                 .return_val => {
@@ -564,7 +566,7 @@ pub const Vm = struct {
                     const entry = snapshot[i];
                     f.hidden[hid + 1] = .{ .int_ = @intCast(i + 1) };
                     if (has_key and ins.a != opcode.no_reg) {
-                        regs[ins.a] = entry.key.toValue();
+                        regs[ins.a] = try entry.key.toValue(self.arena);
                     } else if (!has_key and ins.a != opcode.no_reg) {
                         return self.fatalF(line, "internal: unexpected key binding", .{});
                     }
@@ -676,11 +678,11 @@ pub const Vm = struct {
                 return .null_;
             },
             .str_ => |st| {
-                if (key_v != .int_ and key_v != .float_) return .{ .str_ = "" };
+                if (key_v != .int_ and key_v != .float_) return .{ .str_ = try valmod.newStr(self.arena, "") };
                 const fl = valmod.toNumber(key_v, self.arena).toFloat();
-                if (fl < 0 or fl >= @as(f64, @floatFromInt(st.len))) return .{ .str_ = "" };
+                if (fl < 0 or fl >= @as(f64, @floatFromInt(st.data.len))) return .{ .str_ = try valmod.newStr(self.arena, "") };
                 const i: usize = @intFromFloat(fl);
-                return .{ .str_ = st[i .. i + 1] };
+                return .{ .str_ = try valmod.newStr(self.arena, st.data[i .. i + 1]) };
             },
             .null_ => return .null_,
             else => return self.fatalF(line, "cannot use {s} value as array", .{base.typeName()}),
@@ -774,7 +776,7 @@ pub const Vm = struct {
         }
         // Non-numeric strings are untouched (PHP semantics); a rope is
         // "touched" only if it holds numeric content, which toNumber handles.
-        if (old == .str_ and valmod.numericString(old.str_) == null) {
+        if (old == .str_ and valmod.numericString(old.str_.data) == null) {
             return old;
         }
         const n = valmod.toNumber(old, mem);
@@ -891,7 +893,7 @@ pub const Vm = struct {
     /// Create a builtin exception instance: props message/code/line.
     fn newBuiltinException(self: *Vm, class_name: []const u8, msg: []const u8, line: u32) !*valmod.Object {
         const obj = try valmod.Object.create(self.arena, class_name);
-        try obj.props.append(self.arena, .{ .name = "message", .val = .{ .str_ = msg } });
+        try obj.props.append(self.arena, .{ .name = "message", .val = .{ .str_ = try valmod.newStr(self.arena, msg) } });
         try obj.props.append(self.arena, .{ .name = "code", .val = .{ .int_ = 0 } });
         try obj.props.append(self.arena, .{ .name = "line", .val = .{ .int_ = @intCast(line) } });
         return obj;

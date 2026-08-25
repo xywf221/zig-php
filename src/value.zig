@@ -11,6 +11,19 @@
 
 const std = @import("std");
 
+/// Heap-allocated string header. Boxing strings behind a pointer keeps
+/// `Value` at 16 bytes (Zend-zval style) instead of 24.
+pub const StrVal = struct {
+    data: []const u8,
+};
+
+/// Allocate a string header wrapping `slice` (zero-copy view).
+pub fn newStr(a: std.mem.Allocator, slice: []const u8) !*StrVal {
+    const s = try a.create(StrVal);
+    s.* = .{ .data = slice };
+    return s;
+}
+
 /// Cons-cell rope: a chain of string chunks accumulated by repeated
 /// concatenation. `rest` is always `.str_` or `.rope_`; the total length is
 /// cached so truthiness checks never allocate.
@@ -27,7 +40,7 @@ pub const Rope = struct {
 
     fn byteLen(v: Value) usize {
         return switch (v) {
-            .str_ => |s| s.len,
+            .str_ => |s| s.data.len,
             .rope_ => |r| r.len,
             else => unreachable,
         };
@@ -43,8 +56,9 @@ pub const Rope = struct {
             @memcpy(buf[pos..][0..node.chunk.len], node.chunk);
             switch (node.rest) {
                 .str_ => |s| {
-                    pos -= s.len;
-                    @memcpy(buf[pos..][0..s.len], s);
+                    const d = s.data;
+                    pos -= d.len;
+                    @memcpy(buf[pos..][0..d.len], d);
                     break;
                 },
                 .rope_ => |nr| node = nr,
@@ -107,10 +121,10 @@ pub const Key = union(enum) {
         };
     }
 
-    pub fn toValue(self: Key) Value {
+    pub fn toValue(self: Key, a: std.mem.Allocator) !Value {
         return switch (self) {
-            .int => |i| .{ .int_ = i },
-            .str => |s| .{ .str_ = s },
+            .int => |i| Value{ .int_ = i },
+            .str => |s| Value{ .str_ = try newStr(a, s) },
         };
     }
 };
@@ -120,7 +134,8 @@ pub const Value = union(enum) {
     bool_: bool,
     int_: i64,
     float_: f64,
-    str_: []const u8,
+    /// Boxed string header (keeps Value at 16 bytes, Zend-zval style).
+    str_: *StrVal,
     /// Lazily concatenated string produced by `.` / `.=`. Materializes
     /// (O(total length)) the first time raw bytes are needed.
     rope_: *const Rope,
@@ -223,7 +238,7 @@ pub const Value = union(enum) {
             .bool_ => |b| b,
             .int_ => |i| i != 0,
             .float_ => |f| f != 0.0,
-            .str_ => |s| s.len > 0 and !std.mem.eql(u8, s, "0"),
+            .str_ => |s| s.data.len > 0 and !std.mem.eql(u8, s.data, "0"),
             // Zero-allocation: only a single "0" byte is falsy.
             .rope_ => |r| r.len > 0 and !(r.len == 1 and firstByte(r) == '0'),
             .array_ => |arr| arr.count() > 0,
@@ -234,7 +249,7 @@ pub const Value = union(enum) {
     fn firstByte(r: *const Rope) u8 {
         var node = r;
         while (true) {
-            if (node.rest == .rope_) node = node.rest.rope_ else return node.rest.str_[0];
+            if (node.rest == .rope_) node = node.rest.rope_ else return node.rest.str_.data[0];
         }
     }
 };
@@ -248,7 +263,7 @@ pub fn toString(v: Value, a: std.mem.Allocator) ![]const u8 {
         .bool_ => |b| if (b) "1" else "",
         .int_ => |i| try std.fmt.allocPrint(a, "{d}", .{i}),
         .float_ => |f| try fmtFloat(f, a),
-        .str_ => |s| s,
+        .str_ => |s| s.data,
         .rope_ => |r| r.flatten(a),
         .array_ => "Array",
         // Callers that need PHP's fatal-object-conversion semantics must
@@ -277,10 +292,10 @@ pub fn makeKey(v: Value, a: std.mem.Allocator) !Key {
         .int_ => |i| .{ .int = i },
         .float_ => |f| .{ .int = @intFromFloat(@trunc(f)) },
         .str_ => |s| blk: {
-            if (canonicalIntString(s)) |i| break :blk .{ .int = i };
-            break :blk .{ .str = s };
+            if (canonicalIntString(s.data)) |i| break :blk .{ .int = i };
+            break :blk Key{ .str = s.data };
         },
-        .rope_ => |r| try makeKey(.{ .str_ = try r.flatten(a) }, a),
+        .rope_ => |r| try makeKey(.{ .str_ = try newStr(a, try r.flatten(a)) }, a),
         .array_, .obj_ => fatalKey(),
     };
 }
@@ -394,7 +409,7 @@ pub fn toNumber(v: Value, mem: std.mem.Allocator) Number {
         .bool_ => |b| .{ .int = @intFromBool(b) },
         .int_ => |i| .{ .int = i },
         .float_ => |f| .{ .float = f },
-        .str_ => |s| leadingNumber(s),
+        .str_ => |s| leadingNumber(s.data),
         .rope_ => blk: {
             const s = toString(v, mem) catch break :blk .{ .int = 0 };
             break :blk leadingNumber(s);
@@ -425,27 +440,25 @@ fn strcmpOrder(a: []const u8, b: []const u8) std.math.Order {
 
 /// Loose comparison (`<`, `>`, `==`) approximating PHP 8 semantics.
 pub fn looseCmp(a_in: Value, b_in: Value, mem: std.mem.Allocator) !std.math.Order {
-    // Materialize ropes once; the rest of the machinery works on plain strings.
-    // See strictEq for why the reassignment must be split.
+    // Materialize strings/ropes once; the rest of the machinery works on
+    // plain slices.
     var a = a_in;
     var b = b_in;
-    if (a == .rope_) {
-        const s = try toString(a, mem);
-        a = .{ .str_ = s };
-    }
-    if (b == .rope_) {
-        const s = try toString(b, mem);
-        b = .{ .str_ = s };
-    }
+    var a_str: []const u8 = "";
+    var b_str: []const u8 = "";
+    if (a == .str_) a_str = a.str_.data;
+    if (b == .str_) b_str = b.str_.data;
+    if (a == .rope_) a_str = try toString(a, mem);
+    if (b == .rope_) b_str = try toString(b, mem);
 
     // Fast path: identical scalar types compare directly.
     if (a == .int_ and b == .int_) return std.math.order(a.int_, b.int_);
     if (a == .str_ and b == .str_) {
         // PHP 8: two numeric strings compare numerically.
-        if (numericString(a.str_)) |na| {
-            if (numericString(b.str_)) |nb| return numOrder(na.toFloat(), nb.toFloat());
+        if (numericString(a_str)) |na| {
+            if (numericString(b_str)) |nb| return numOrder(na.toFloat(), nb.toFloat());
         }
-        return strcmpOrder(a.str_, b.str_);
+        return strcmpOrder(a_str, b_str);
     }
 
     // Booleans (and anything compared against one) compare by truthiness.
@@ -456,8 +469,8 @@ pub fn looseCmp(a_in: Value, b_in: Value, mem: std.mem.Allocator) !std.math.Orde
     }
 
     // null vs string compares "" against the string (PHP 8).
-    if (a == .null_ and b == .str_) return strcmpOrder("", b.str_);
-    if (a == .str_ and b == .null_) return strcmpOrder(a.str_, "");
+    if (a == .null_ and b == .str_) return strcmpOrder("", b_str);
+    if (a == .str_ and b == .null_) return strcmpOrder(a_str, "");
 
     // Numbers.
     const a_num = a == .int_ or a == .float_;
@@ -474,27 +487,27 @@ pub fn looseCmp(a_in: Value, b_in: Value, mem: std.mem.Allocator) !std.math.Orde
     // number vs string: numeric comparison iff the string is fully numeric,
     // otherwise both sides are compared as strings (PHP 8 rule).
     if (a_num and b == .str_) {
-        if (numericString(b.str_)) |n| {
+        if (numericString(b_str)) |n| {
             return numOrder(toNumber(a, mem).toFloat(), n.toFloat());
         }
-        return strcmpOrder(try toString(a, mem), b.str_);
+        return strcmpOrder(try toString(a, mem), b_str);
     }
     if (a == .str_ and b_num) {
-        if (numericString(a.str_)) |n| {
+        if (numericString(a_str)) |n| {
             return numOrder(n.toFloat(), toNumber(b, mem).toFloat());
         }
-        return strcmpOrder(a.str_, try toString(b, mem));
+        return strcmpOrder(a_str, try toString(b, mem));
     }
 
     if (a == .str_ and b == .str_) {
         // PHP 8: two numeric strings compare numerically ("10" < "9" is
         // false); otherwise byte-wise.
-        if (numericString(a.str_)) |na| {
-            if (numericString(b.str_)) |nb| {
+        if (numericString(a_str)) |na| {
+            if (numericString(b_str)) |nb| {
                 return numOrder(na.toFloat(), nb.toFloat());
             }
         }
-        return strcmpOrder(a.str_, b.str_);
+        return strcmpOrder(a_str, b_str);
     }
 
     // Arrays.
@@ -542,11 +555,13 @@ pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) std.mem.Alloca
     // `a` before the call reads it.
     if (a == .rope_) {
         const s = try toString(a, mem);
-        a = .{ .str_ = s };
+        const hdr = try newStr(mem, s);
+        a = .{ .str_ = hdr };
     }
     if (b == .rope_) {
         const s = try toString(b, mem);
-        b = .{ .str_ = s };
+        const hdr = try newStr(mem, s);
+        b = .{ .str_ = hdr };
     }
     // PHP object identity: === compares instance pointers.
     if (a == .obj_ or b == .obj_) return a == .obj_ and b == .obj_ and a.obj_ == b.obj_;
@@ -557,7 +572,7 @@ pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) std.mem.Alloca
         .int_ => |x| x == b.int_,
         .float_ => |x| x == b.float_,
         .str_ => |x| blk: {
-            break :blk std.mem.eql(u8, x, b.str_);
+            break :blk std.mem.eql(u8, x.data, b.str_.data);
         },
         .array_ => |x| try arraysStrictEq(x, b.array_, mem),
         else => unreachable,
@@ -585,12 +600,15 @@ fn arraysStrictEq(x: *Value.Array, y: *Value.Array, mem: std.mem.Allocator) std.
 const t = std.testing;
 
 test "truthiness" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
     try t.expect(!(@as(Value, .null_)).truthy());
     try t.expect(!(@as(Value, .{ .int_ = 0 })).truthy());
     try t.expect((@as(Value, .{ .int_ = -1 })).truthy());
-    try t.expect(!(@as(Value, .{ .str_ = "" })).truthy());
-    try t.expect(!(@as(Value, .{ .str_ = "0" })).truthy());
-    try t.expect((@as(Value, .{ .str_ = "0.0" })).truthy());
+    try t.expect(!(@as(Value, .{ .str_ = try newStr(a, "") })).truthy());
+    try t.expect(!(@as(Value, .{ .str_ = try newStr(a, "0") })).truthy());
+    try t.expect((@as(Value, .{ .str_ = try newStr(a, "0.0") })).truthy());
     try t.expect(!(@as(Value, .{ .bool_ = false })).truthy());
 }
 
@@ -622,9 +640,9 @@ test "rope strict equality" {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const m = arena_state.allocator();
-    const r1 = try Rope.cons(m, .{ .str_ = "x" }, "y");
+    const r1 = try Rope.cons(m, .{ .str_ = try newStr(m, "x") }, "y");
     const r2 = try Rope.cons(m, .{ .rope_ = r1 }, "z");
-    try t.expect(try strictEq(.{ .rope_ = r2 }, .{ .str_ = "xyz" }, m));
+    try t.expect(try strictEq(.{ .rope_ = r2 }, .{ .str_ = try newStr(m, "xyz") }, m));
 }
 
 test "rope flatten debug" {
@@ -632,7 +650,7 @@ test "rope flatten debug" {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const m = arena_state.allocator();
-    const r1 = try Rope.cons(m, .{ .str_ = "x" }, "y");
+    const r1 = try Rope.cons(m, .{ .str_ = try newStr(m, "x") }, "y");
     const flat = try r1.flatten(m);
     try t.expectEqualStrings("xy", flat);
     const r2 = try Rope.cons(m, .{ .rope_ = r1 }, "z");
@@ -647,11 +665,11 @@ test "rope strict eq steps" {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const m = arena_state.allocator();
-    const r1 = try Rope.cons(m, .{ .str_ = "x" }, "y");
+    const r1 = try Rope.cons(m, .{ .str_ = try newStr(m, "x") }, "y");
     const r2 = try Rope.cons(m, .{ .rope_ = r1 }, "z");
     const mat = try toString(.{ .rope_ = r2 }, m);
     try t.expectEqualStrings("xyz", mat);
-    try t.expect(strictEq(.{ .str_ = mat }, .{ .str_ = "xyz" }, m) catch false);
+    try t.expect(strictEq(.{ .str_ = try newStr(m, mat) }, .{ .str_ = try newStr(m, "xyz") }, m) catch false);
 }
 
 
@@ -660,9 +678,9 @@ test "rope strict eq dissected" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const m = arena_state.allocator();
-    const r1 = try Rope.cons(m, .{ .str_ = "x" }, "y");
+    const r1 = try Rope.cons(m, .{ .str_ = try newStr(m, "x") }, "y");
     const r2 = try Rope.cons(m, .{ .rope_ = r1 }, "z");
     const v1: Value = .{ .rope_ = r2 };
-    const result = try strictEq(v1, .{ .str_ = "xyz" }, m);
+    const result = try strictEq(v1, .{ .str_ = try newStr(m, "xyz") }, m);
     std.debug.print("result={}\n", .{result});
 }

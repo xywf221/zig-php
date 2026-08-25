@@ -115,6 +115,11 @@ fn asStr(in: *Vm, v: Value) Error![]const u8 {
     return valmod.toString(v, in.arena);
 }
 
+/// Box a byte slice into a string Value.
+fn mkStr(in: *Vm, slice: []const u8) Error!Value {
+    return .{ .str_ = try valmod.newStr(in.arena, slice) };
+}
+
 fn wantInt(in: *Vm, v: Value) i64 {
     return valmod.toNumber(v, in.arena).int;
 }
@@ -142,7 +147,7 @@ fn fn_strtolower(in: *Vm, args: []const Value) Error!Value {
     const s = try asStr(in, args[0]);
     const out = try in.arena.dupe(u8, s);
     for (out) |*c| c.* = std.ascii.toLower(c.*);
-    return .{ .str_ = out };
+    return try mkStr(in, out);
 }
 
 fn fn_strtoupper(in: *Vm, args: []const Value) Error!Value {
@@ -150,7 +155,7 @@ fn fn_strtoupper(in: *Vm, args: []const Value) Error!Value {
     const s = try asStr(in, args[0]);
     const out = try in.arena.dupe(u8, s);
     for (out) |*c| c.* = std.ascii.toUpper(c.*);
-    return .{ .str_ = out };
+    return try mkStr(in, out);
 }
 
 fn fn_strrev(in: *Vm, args: []const Value) Error!Value {
@@ -158,7 +163,7 @@ fn fn_strrev(in: *Vm, args: []const Value) Error!Value {
     const s = try asStr(in, args[0]);
     const out = try in.arena.dupe(u8, s);
     std.mem.reverse(u8, out);
-    return .{ .str_ = out };
+    return try mkStr(in, out);
 }
 
 fn fn_substr(in: *Vm, args: []const Value) Error!Value {
@@ -166,16 +171,16 @@ fn fn_substr(in: *Vm, args: []const Value) Error!Value {
     const s = try asStr(in, args[0]);
     var start = wantInt(in, args[1]);
     if (start < 0) start += @intCast(s.len);
-    if (start < 0 or start >= s.len) return .{ .str_ = "" };
+    if (start < 0 or start >= s.len) return try mkStr(in, "");
     const from: usize = @intCast(start);
 
-    if (args.len == 2) return .{ .str_ = s[from..] };
+    if (args.len == 2) return try mkStr(in, s[from..]);
 
     var len = wantInt(in, args[2]);
     if (len < 0) len += @intCast(s.len - from);
-    if (len <= 0) return .{ .str_ = "" };
+    if (len <= 0) return try mkStr(in, "");
     const to = @min(from + @as(usize, @intCast(len)), s.len);
-    return .{ .str_ = s[from..to] };
+    return try mkStr(in, s[from..to]);
 }
 
 fn fn_strpos(in: *Vm, args: []const Value) Error!Value {
@@ -193,7 +198,7 @@ fn fn_str_repeat(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 2, "str_repeat($string, $times)");
     const st = try asStr(in, args[0]);
     const times = wantInt(in, args[1]);
-    if (times <= 0) return .{ .str_ = "" };
+    if (times <= 0) return try mkStr(in, "");
     const n: usize = @intCast(times);
     if (st.len * n > 256 * 1024 * 1024) {
         return in.fatalF(0, "str_repeat(): result too large", .{});
@@ -201,7 +206,7 @@ fn fn_str_repeat(in: *Vm, args: []const Value) Error!Value {
     const out = try in.arena.alloc(u8, st.len * n);
     var i: usize = 0;
     while (i < n) : (i += 1) @memcpy(out[i * st.len ..][0..st.len], st);
-    return .{ .str_ = out };
+    return try mkStr(in, out);
 }
 
 fn fn_str_replace(in: *Vm, args: []const Value) Error!Value {
@@ -209,39 +214,39 @@ fn fn_str_replace(in: *Vm, args: []const Value) Error!Value {
     const search = try asStr(in, args[0]);
     const replace = try asStr(in, args[1]);
     const subject = try asStr(in, args[2]);
-    if (search.len == 0) return .{ .str_ = subject };
-    return .{ .str_ = try std.mem.replaceOwned(u8, in.arena, subject, search, replace) };
+    if (search.len == 0) return try mkStr(in, subject);
+    return try mkStr(in, try std.mem.replaceOwned(u8, in.arena, subject, search, replace));
 }
 
 const ws = " \t\n\r\x00\x0b\x0c";
 
 fn fn_trim(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "trim($string)");
-    return .{ .str_ = std.mem.trim(u8, try asStr(in, args[0]), ws) };
+    return try mkStr(in, std.mem.trim(u8, try asStr(in, args[0]), ws));
 }
 
 fn fn_ltrim(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "ltrim($string)");
-    return .{ .str_ = std.mem.trimStart(u8, try asStr(in, args[0]), ws) };
+    return try mkStr(in, std.mem.trimStart(u8, try asStr(in, args[0]), ws));
 }
 
 fn fn_rtrim(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "rtrim($string)");
-    return .{ .str_ = std.mem.trimEnd(u8, try asStr(in, args[0]), ws) };
+    return try mkStr(in, std.mem.trimEnd(u8, try asStr(in, args[0]), ws));
 }
 
 fn fn_ucfirst(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "ucfirst($string)");
     const st = try in.arena.dupe(u8, try asStr(in, args[0]));
     if (st.len > 0) st[0] = std.ascii.toUpper(st[0]);
-    return .{ .str_ = st };
+    return try mkStr(in, st);
 }
 
 fn fn_lcfirst(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "lcfirst($string)");
     const st = try in.arena.dupe(u8, try asStr(in, args[0]));
     if (st.len > 0) st[0] = std.ascii.toLower(st[0]);
-    return .{ .str_ = st };
+    return try mkStr(in, st);
 }
 
 fn fn_str_contains(in: *Vm, args: []const Value) Error!Value {
@@ -297,14 +302,13 @@ fn fn_sprintf(in: *Vm, args: []const Value) Error!Value {
             },
         }
     }
-    return .{ .str_ = out.items };
+    return try mkStr(in, out.items);
 }
 
 // -- arrays ------------------------------------------------------------------------
 
 fn fn_get_class(in: *Vm, args: []const Value) Error!Value {
-    _ = in;
-    if (args.len == 1 and args[0] == .obj_) return .{ .str_ = args[0].obj_.class_name };
+    if (args.len == 1 and args[0] == .obj_) return try mkStr(in, args[0].obj_.class_name);
     return .{ .bool_ = false }; // simplified: no class-scope form
 }
 
@@ -358,7 +362,7 @@ fn fn_array_keys(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "array_keys($array)");
     const arr = try wantArray(in, args[0], "array_keys");
     const out = try Value.Array.create(in.arena);
-    for (arr.entries.items) |e| try out.appendVal(in.arena, e.key.toValue());
+    for (arr.entries.items) |e| try out.appendVal(in.arena, try e.key.toValue(in.arena));
     return .{ .array_ = out };
 }
 
@@ -449,7 +453,7 @@ fn fn_implode(in: *Vm, args: []const Value) Error!Value {
         if (ei > 0) try buf.appendSlice(in.arena, glue);
         try buf.appendSlice(in.arena, try valmod.toString(e.val, in.arena));
     }
-    return .{ .str_ = buf.items };
+    return try mkStr(in, buf.items);
 }
 
 fn fn_explode(in: *Vm, args: []const Value) Error!Value {
@@ -460,7 +464,7 @@ fn fn_explode(in: *Vm, args: []const Value) Error!Value {
     const out = try Value.Array.create(in.arena);
     var iter = std.mem.splitSequence(u8, subject, sep);
     while (iter.next()) |piece| {
-        try out.appendVal(in.arena, .{ .str_ = piece });
+        try out.appendVal(in.arena, try mkStr(in, piece));
     }
     return .{ .array_ = out };
 }
@@ -587,7 +591,7 @@ fn fn_pi(in: *Vm, args: []const Value) Error!Value {
 fn fn_intval(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "intval($value)");
     if (args[0] == .str_) {
-        if (valmod.numericString(args[0].str_)) |n| {
+        if (valmod.numericString(args[0].str_.data)) |n| {
             return .{ .int_ = switch (n) {
                 .int => |iv| iv,
                 .float => |fv| @intFromFloat(@trunc(fv)),
@@ -605,7 +609,7 @@ fn fn_floatval(in: *Vm, args: []const Value) Error!Value {
 
 fn fn_strval(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "strval($value)");
-    return .{ .str_ = try asStr(in, args[0]) };
+    return try mkStr(in, try asStr(in, args[0]));
 }
 
 fn fn_boolval(in: *Vm, args: []const Value) Error!Value {
@@ -641,7 +645,7 @@ fn fn_is_numeric(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "is_numeric($value)");
     return switch (args[0]) {
         .int_, .float_ => .{ .bool_ = true },
-        .str_ => |st| .{ .bool_ = valmod.numericString(st) != null },
+        .str_ => |st| .{ .bool_ = valmod.numericString(st.data) != null },
         else => .{ .bool_ = false },
     };
 }
@@ -649,7 +653,7 @@ fn fn_is_numeric(in: *Vm, args: []const Value) Error!Value {
 fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "gettype($value)");
     // PHP keeps the historical names.
-    return .{ .str_ = switch (args[0]) {
+    const name: []const u8 = switch (args[0]) {
         .null_ => "NULL",
         .bool_ => "boolean",
         .int_ => "integer",
@@ -657,7 +661,8 @@ fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
         .str_, .rope_ => "string",
         .array_ => "array",
         .obj_ => "object",
-    } };
+    };
+    return try mkStr(in, name);
 }
 
 // -- output ------------------------------------------------------------------------
@@ -750,7 +755,7 @@ fn fn_print_r(in: *Vm, args: []const Value) Error!Value {
         in.out = &aw.writer;
         defer in.out = saved;
         try printRValue(in, args[0], 0);
-        return .{ .str_ = aw.written() };
+        return try mkStr(in, aw.written());
     }
     try printRValue(in, args[0], 0);
     return .{ .bool_ = true };

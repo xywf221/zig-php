@@ -38,7 +38,7 @@ pub const Chunk = struct {
                 if (self.int_ix.get(i)) |ix| return ix;
             },
             .str_ => |s| {
-                if (self.str_ix.get(s)) |ix| return ix;
+                if (self.str_ix.get(s.data)) |ix| return ix;
             },
             .null_, .bool_, .float_, .array_ => {
                 for (self.consts.items, 0..) |c, i| {
@@ -51,7 +51,7 @@ pub const Chunk = struct {
         try self.consts.append(a, v);
         switch (v) {
             .int_ => |i| try self.int_ix.put(a, i, ix),
-            .str_ => |s| try self.str_ix.put(a, s, ix),
+            .str_ => |s| try self.str_ix.put(a, s.data, ix),
             else => {},
         }
         return ix;

@@ -334,7 +334,7 @@ pub const Compiler = struct {
         const param_base: usize = if (implicit_this) 1 else 0;
         for (fd.params, 0..) |p, i| {
             if (p.default) |de| {
-                f.defaults[param_base + i] = constEval(de) orelse {
+                f.defaults[param_base + i] = constEval(de, arena) orelse {
                     diag.msg = try std.fmt.allocPrint(arena, "unsupported default parameter expression in {s}() (compile-time constants only)", .{fd.name});
                     diag.line = de.line;
                     return error.SyntaxError;
@@ -404,7 +404,8 @@ pub const Compiler = struct {
     }
 
     fn nameConst(self: *Compiler, name: []const u8) Error!u32 {
-        return self.chunk.addConst(self.arena, .{ .str_ = name }) catch |e| switch (e) {
+        const boxed = valmod.newStr(self.arena, name) catch return error.OutOfMemory;
+        return self.chunk.addConst(self.arena, .{ .str_ = boxed }) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
         };
     }
@@ -733,7 +734,8 @@ pub const Compiler = struct {
     /// never assigned anywhere in this function (flow-insensitive).
     fn checkDefined(self: *Compiler, slot: usize, name: []const u8, line: u32) Error!void {
         if (self.ctx.defined.contains(slot)) return;
-        const ci = try self.ctx.func.chunk.addConst(self.arena, .{ .str_ = name });
+        const boxed = valmod.newStr(self.arena, name) catch return error.OutOfMemory;
+        const ci = try self.ctx.func.chunk.addConst(self.arena, .{ .str_ = boxed });
         _ = try self.emit1(.warn_undef, ci, line);
     }
 
@@ -810,7 +812,8 @@ pub const Compiler = struct {
                 _ = try self.emit2(.ld_const, dst, k, line);
             },
             .str_lit => |st| {
-                const k = try self.chunk.addConst(self.arena, .{ .str_ = st });
+                const boxed = try valmod.newStr(self.arena, st);
+                const k = try self.chunk.addConst(self.arena, .{ .str_ = boxed });
                 _ = try self.emit2(.ld_const, dst, k, line);
             },
             .bool_lit => |b| _ = try self.emit1(if (b) .ld_true else .ld_false, dst, line),
@@ -824,7 +827,8 @@ pub const Compiler = struct {
 
             .interp_str => |parts| {
                 if (parts.len == 0) {
-                    const k = try self.chunk.addConst(self.arena, .{ .str_ = "" });
+                    const empty = try valmod.newStr(self.arena, "");
+                    const k = try self.chunk.addConst(self.arena, .{ .str_ = empty });
                     _ = try self.emit2(.ld_const, dst, k, line);
                     return;
                 }
@@ -833,7 +837,8 @@ pub const Compiler = struct {
                     const r = base + @as(u32, @intCast(i));
                     switch (part) {
                         .literal => |lit| {
-                            const k = try self.chunk.addConst(self.arena, .{ .str_ = lit });
+                            const boxed = try valmod.newStr(self.arena, lit);
+                            const k = try self.chunk.addConst(self.arena, .{ .str_ = boxed });
                             _ = try self.emit2(.ld_const, r, k, line);
                         },
                         .var_ref => |name| {
@@ -849,7 +854,8 @@ pub const Compiler = struct {
                                 const tk = self.ctx.alloc();
                                 switch (key) {
                                     .str => |ks| {
-                                        const k = try self.chunk.addConst(self.arena, .{ .str_ = ks });
+                                        const boxed = try valmod.newStr(self.arena, ks);
+                                        const k = try self.chunk.addConst(self.arena, .{ .str_ = boxed });
                                         _ = try self.emit2(.ld_const, tk, k, line);
                                     },
                                     .int => |iv| {
@@ -1287,7 +1293,7 @@ pub const Compiler = struct {
                 return .{ .local = @intCast(slot) };
             },
             else => {
-                const cv = constEval(e) orelse return null;
+                const cv = constEval(e, self.arena) orelse return null;
                 const idx = self.chunk.addConst(self.arena, cv) catch return error.OutOfMemory;
                 if (idx > 0xFFFFFF) return null;
                 return .{ .constant = idx };
@@ -1357,20 +1363,23 @@ fn compoundBinOp(op: ast.AssignOp) ast.BinOp {
 }
 
 /// Evaluate a compile-time constant expression (literal / unary minus).
-fn constEval(e: *ast.Expr) ?Value {
+fn constEval(e: *ast.Expr, a: std.mem.Allocator) ?Value {
     return switch (e.kind) {
         .int_lit => |i| Value{ .int_ = i },
         .float_lit => |f| Value{ .float_ = f },
-        .str_lit => |st| Value{ .str_ = st },
+        .str_lit => |st| blk: {
+            const s = valmod.newStr(a, st) catch break :blk null;
+            break :blk Value{ .str_ = s };
+        },
         .bool_lit => |b| Value{ .bool_ = b },
         .null_lit => Value.null_,
         .unary => |u| switch (u.op) {
-            .neg => switch (constEval(u.operand) orelse return null) {
+            .neg => switch (constEval(u.operand, a) orelse return null) {
                 .int_ => |i| Value{ .int_ = -i },
                 .float_ => |fl| Value{ .float_ = -fl },
                 else => null,
             },
-            .pos => constEval(u.operand),
+            .pos => constEval(u.operand, a),
             else => null,
         },
         else => null,

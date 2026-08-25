@@ -19,7 +19,7 @@ bash scripts/bench.sh 5
 | workload | description | zphp (ms) | php (ms) | ratio |
 |---|---|---:|---:|---:|
 | fib | recursive fibonacci(27) — call overhead, branching | 77 | 96 | **0.8x** |
-| loop | 30M iteration integer accumulation | 945 | 486 | 1.9x |
+| loop | 30M iteration integer accumulation | 887 | 511 | 1.7x |
 | arrays | 500k appends + foreach sum | 100 | 100 | **1.0x** |
 | strings | 100k `.` concatenations into a growing string | 37 | 83 | **0.4x** |
 
@@ -33,6 +33,10 @@ Key optimizations beyond the ISA switch itself:
 - int/int fast paths bypass the loose-comparison machinery
 - call frames only null-init locals, not temporaries; arguments copy
   directly between register files; register files are pooled across calls
+- strings boxed behind heap headers: Value is a 16-byte tagged struct
+  (was 24), Zend-zval style. True single-word NaN-boxing was evaluated
+  and rejected: PHP requires full i64 (NaN-boxing caps at 48-bit SMIs)
+  and slice strings need two words anyway
 
 ## History
 
