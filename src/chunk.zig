@@ -7,26 +7,29 @@ const valmod = @import("value.zig");
 
 pub const Value = valmod.Value;
 
+/// One register-machine instruction: opcode + up to three operands.
+pub const Instr = struct {
+    op: opcode.Op,
+    a: u32 = 0,
+    b: u32 = 0,
+    c: u32 = 0,
+};
+
 pub const Chunk = struct {
-    code: std.ArrayList(opcode.Instr) = .empty,
+    code: std.ArrayList(Instr) = .empty,
     lines: std.ArrayList(u32) = .empty,
     consts: std.ArrayList(Value) = .empty,
 
-    pub fn emit(self: *Chunk, a: std.mem.Allocator, op: opcode.Op, line: u32) !usize {
-        return self.emitArg(a, op, 0, line);
-    }
-
-    pub fn emitArg(self: *Chunk, a: std.mem.Allocator, op: opcode.Op, arg: u32, line: u32) !usize {
-        try self.code.append(a, .{ .op = op, .arg = arg });
+    pub fn emit(self: *Chunk, a: std.mem.Allocator, ins: Instr, line: u32) !usize {
+        try self.code.append(a, ins);
         try self.lines.append(a, line);
         return self.code.items.len - 1;
     }
 
     pub fn addConst(self: *Chunk, a: std.mem.Allocator, v: Value) !u32 {
-        // Deduplicate identical constants to keep pools small.
+        // Deduplicate identical immutable constants.
         for (self.consts.items, 0..) |c, i| {
             if (valmod.strictEq(c, v)) {
-                // Only dedupe immutable scalars.
                 switch (v) {
                     .null_, .bool_, .int_, .float_, .str_ => return @intCast(i),
                     .array_ => {},
@@ -42,13 +45,13 @@ pub const Chunk = struct {
 pub const Func = struct {
     name: []const u8,
     arity: usize,
-    /// Number of local variable slots (functions only; the top level uses
-    /// the globals map).
+    /// Parameter + local variable registers.
     nlocals: usize = 0,
-    /// Extra scratch slots (foreach iterators).
+    /// Expression temporaries above the locals.
     ntemps: usize = 0,
-    /// Default parameter values; `null` entry = required parameter.
-    /// The minimal core supports constant defaults only.
+    /// Hidden foreach-iterator storage (snapshot + cursor pairs).
+    nhidden: usize = 0,
+    /// Constant default parameter values; null entry = required parameter.
     defaults: []?Value = &.{},
     chunk: Chunk = .{},
 };

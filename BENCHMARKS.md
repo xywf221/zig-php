@@ -14,28 +14,28 @@ zig build -Doptimize=ReleaseFast
 bash scripts/bench.sh 5
 ```
 
-## Results (bytecode VM + fused superinstructions, ReleaseFast)
+## Results (register bytecode VM, ReleaseFast)
 
 | workload | description | zphp (ms) | php (ms) | ratio |
 |---|---|---:|---:|---:|
-| fib | recursive fibonacci(27) — call overhead, branching | 102 | 97 | 1.1x |
-| loop | 30M iteration integer accumulation | 1278 | 488 | 2.6x |
-| arrays | 500k appends + foreach sum | 83 | 99 | **0.8x** |
-| strings | 100k `.` concatenations into a growing string | 1006 | 84 | 12.0x |
+| fib | recursive fibonacci(27) — call overhead, branching | 125 | 96 | 1.3x |
+| loop | 30M iteration integer accumulation | 1334 | 494 | 2.7x |
+| arrays | 500k appends + foreach sum | 74 | 99 | **0.7x** |
+| strings | 100k `.` concatenations into a growing string | 1027 | 84 | 12.5x |
 
-Fusion: hot-loop patterns compile to single instructions —
-`local CMP const/local` + jump → `cmp_jmp_*`, `local += local/const`
-→ `add/sub_set_local_*`, `$i++` statement → discard variant.
-The loop benchmark drops from ~13 dispatched instructions per iteration to 4.
+The compiler is target-directed (`compileInto(dst, expr)`): expressions
+write straight into their destination register, so even "generic" code
+contains no operand-stack shuffling. Fused compare-and-branch instructions
+remain for loop conditions; the loop body is down to 4 dispatched
+instructions per iteration.
 
 ## History
 
 | engine | fib | loop | arrays | strings |
 |---|---:|---:|---:|---:|
 | tree-walking interpreter | 1.7x | 7.8x | 1.5x | 11.9x |
-| bytecode VM v1 | 1.1x | 8.2x | 1.4x | 12.0x |
-| + top-level slot promotion | 1.1x | 4.4x | 1.0x | 11.9x |
-| + instruction fusion | 1.1x | **2.6x** | **0.8x** | 12.0x |
+| stack bytecode VM (fused) | 1.1x | 2.6x | 0.8x | 12.0x |
+| **register bytecode VM** | 1.3x | **2.7x** | **0.7x** | 12.5x |
 
 (ratios vs PHP 8.5 + OPcache; lower is better)
 

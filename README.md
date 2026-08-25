@@ -86,10 +86,10 @@ ReleaseFast 下与 PHP 8.5 (OPcache) 的对比（Windows, min of 5）：
 
 | workload | zphp | php | 比率 |
 |---|---|---|---|
-| fib(27) 递归 | 102ms | 97ms | **1.1x** |
-| 3000 万次循环累加 | 1278ms | 488ms | 2.6x* |
-| 50 万次数组追加 + foreach | 83ms | 99ms | **0.8x** |
-| 10 万次字符串拼接 | 1006ms | 84ms | 12.0x |
+| fib(27) 递归 | 125ms | 96ms | 1.3x |
+| 3000 万次循环累加 | 1334ms | 494ms | 2.7x* |
+| 50 万次数组追加 + foreach | 74ms | 99ms | **0.7x** |
+| 10 万次字符串拼接 | 1027ms | 84ms | 12.5x |
 
 \* 已实现指令融合：`local CMP const/local`+跳转、`local += x`、
 `$i++` 各自编译为单条指令，循环体从 ~13 条/迭代降至 4 条。
@@ -114,8 +114,8 @@ compiler.zig                   interp.zig
 （循环回边/常量池/slot 分配）      （--tree 启用，用于一致性对照）
    │ chunk.Func
    ▼
-vm.zig             栈式字节码虚拟机：共享操作数栈 + 每帧局部 slot 数组，
-                   平坦 switch 派发，~60 条指令
+vm.zig             寄存器式字节码虚拟机：每帧平坦寄存器文件，
+                   三地址指令，平坦 switch 派发，~60 条指令
    │
    ├── opcode.zig    指令集定义与操作数打包
    ├── chunk.zig     字节块：指令流 / 常量池 / 行号表 / 函数单元

@@ -1,22 +1,20 @@
-//! Stack-based bytecode VM for zphp.
+//! Register-based bytecode VM for zphp.
 //!
 //! Execution model (QuickJS-flavored):
-//!   * one shared operand stack; each frame owns a base offset,
-//!   * per-frame local slot arrays + foreach temp slots,
-//!   * flat dispatch loop over `Op` — no AST re-walking, no pointer
-//!     chasing through node unions on hot paths.
-//!
-//! Frame-pointer discipline: `runFrame` re-derives the current frame
-//! pointer after every operation that can mutate the frame list (call /
-//! return); all other opcodes cannot touch it, so hot paths keep a stable
-//! pointer. Instruction pointers are written back before those mutations.
+//!   * each frame owns a flat register file: locals at [0..nlocals),
+//!     expression temporaries above,
+//!   * no operand stack — three-address instructions read and write
+//!     registers directly,
+//!   * calls place arguments in consecutive caller registers; the callee's
+//!     return value overwrites the first argument register,
+//!   * hidden per-frame storage hosts foreach snapshot iterators.
 
 const std = @import("std");
 const valmod = @import("value.zig");
 const opcode = @import("opcode.zig");
 const chunkmod = @import("chunk.zig");
-const builtins = @import("builtins.zig");
 const compiler_mod = @import("compiler.zig");
+const builtins = @import("builtins.zig");
 
 const Op = opcode.Op;
 const Value = valmod.Value;
@@ -33,12 +31,10 @@ pub const Vm = struct {
     arena: std.mem.Allocator,
     out: *std.Io.Writer,
     program: *compiler_mod.Program,
-    globals: std.StringHashMapUnmanaged(Value) = .empty,
-    /// Functions registered so far (top-level set is preloaded; conditional
-    /// declarations register when execution reaches them).
+    /// Functions registered so far (conditional declarations register when
+    /// execution reaches them).
     funcs: std.StringHashMapUnmanaged(*Func) = .empty,
 
-    stack: std.ArrayList(Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
 
     // Diagnostics.
@@ -48,16 +44,17 @@ pub const Vm = struct {
     const Frame = struct {
         func: *Func,
         ip: usize,
-        locals: []Value,
-        temps: []Value,
-        stack_base: usize,
+        regs: []Value,
+        /// foreach snapshot/cursor pairs, indexed by hidden id.
+        hidden: []Value,
+        /// Where to store this frame's return value in the CALLER's registers.
+        result_reg: u32,
     };
 
     pub fn init(arena: std.mem.Allocator, out: *std.Io.Writer, program: *compiler_mod.Program) Vm {
         var vm = Vm{ .arena = arena, .out = out, .program = program };
-        // Preload all compiled declarations (PHP hoists unconditional
-        // top-level functions; conditional ones also register via
-        // declare_func when execution reaches them).
+        // Preload compiled declarations (PHP hoists unconditional top-level
+        // functions; conditional ones register via declare_func on execution).
         var it = program.funcs.iterator();
         while (it.next()) |entry| {
             vm.funcs.put(arena, entry.key_ptr.*, entry.value_ptr.*) catch {};
@@ -71,31 +68,24 @@ pub const Vm = struct {
         return error.Fatal;
     }
 
+    fn newFrameRegs(self: *Vm, f: *Func) Error![]Value {
+        const n = f.nlocals + f.ntemps;
+        const regs = try self.arena.alloc(Value, n);
+        for (regs) |*r| r.* = .null_;
+        return regs;
+    }
+
     /// Execute the program (main function) to completion.
     pub fn run(self: *Vm) Error!void {
         const mainf = self.program.main_func;
-        const main_locals = try self.arena.alloc(Value, mainf.nlocals);
-        for (main_locals) |*l| l.* = .null_;
         try self.frames.append(self.arena, .{
             .func = mainf,
             .ip = 0,
-            .locals = main_locals,
-            .temps = try self.arena.alloc(Value, mainf.ntemps),
-            .stack_base = 0,
+            .regs = try self.newFrameRegs(mainf),
+            .hidden = try self.arena.alloc(Value, mainf.nhidden),
+            .result_reg = opcode.no_reg,
         });
         try self.runFrame();
-    }
-
-    fn push(self: *Vm, v: Value) Error!void {
-        try self.stack.append(self.arena, v);
-    }
-
-    fn pop(self: *Vm) Value {
-        return self.stack.pop().?;
-    }
-
-    fn peek(self: *Vm) Value {
-        return self.stack.items[self.stack.items.len - 1];
     }
 
     /// Run frames until the bottom frame returns.
@@ -119,73 +109,71 @@ pub const Vm = struct {
                 try self.popFrame(.null_);
                 return;
             }
-            const instr = code[f.ip];
+            const ins = code[f.ip];
             const line = lines[f.ip];
+            const regs = f.regs;
             f.ip += 1;
 
-            switch (instr.op) {
-                .pop => _ = self.pop(),
-                .dup => try self.push(self.peek()),
-                .dup2 => {
-                    const b = self.stack.items[self.stack.items.len - 1];
-                    const a = self.stack.items[self.stack.items.len - 2];
-                    try self.push(a);
-                    try self.push(b);
-                },
-
-                .const_k => try self.push(consts[instr.arg]),
-                .null_ => try self.push(.null_),
-                .true_ => try self.push(.{ .bool_ = true }),
-                .false_ => try self.push(.{ .bool_ = false }),
+            switch (ins.op) {
+                .ld_const => regs[ins.a] = consts[ins.b],
+                .ld_null => regs[ins.a] = .null_,
+                .ld_true => regs[ins.a] = .{ .bool_ = true },
+                .ld_false => regs[ins.a] = .{ .bool_ = false },
+                .mov => regs[ins.a] = regs[ins.b],
                 .inline_arg => {}, // data word
 
-                .get_local => try self.push(f.locals[instr.arg]),
-                .set_local => f.locals[instr.arg] = self.pop(),
-                .get_global => try self.push(self.globals.get(consts[instr.arg].str_) orelse .null_),
-                .set_global => try self.globals.put(self.arena, consts[instr.arg].str_, self.pop()),
-
                 .declare_func => {
-                    const f2 = self.program.funcs.get(consts[instr.arg].str_) orelse
+                    const cf = self.program.funcs.get(consts[ins.a].str_) orelse
                         return self.fatalF(line, "internal: uncompiled function", .{});
-                    try self.funcs.put(self.arena, consts[instr.arg].str_, f2);
+                    try self.funcs.put(self.arena, consts[ins.a].str_, cf);
                 },
 
-                .get_container_local => {
-                    switch (f.locals[instr.arg]) {
-                        .array_ => |arr| try self.push(.{ .array_ = arr }),
+                .new_array => regs[ins.a] = .{ .array_ = try Value.Array.create(self.arena) },
+                .append_arr => {
+                    const arr = try self.wantArray(regs[ins.a], line);
+                    try arr.appendVal(self.arena, regs[ins.b]);
+                },
+                .set_index => {
+                    const arr = try self.wantArray(regs[ins.a], line);
+                    if (regs[ins.b] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
+                    try arr.set(self.arena, try valmod.makeKey(regs[ins.b], self.arena), regs[ins.c]);
+                },
+                .get_index => {
+                    regs[ins.a] = try self.indexRead(regs[ins.b], regs[ins.c], line);
+                },
+                .isset_index => {
+                    const container = regs[ins.b];
+                    const key_v = regs[ins.c];
+                    regs[ins.a] = .{ .bool_ = switch (container) {
+                        .null_ => false,
+                        .array_ => |arr| blk: {
+                            if (key_v == .array_) break :blk false;
+                            const found = arr.get(try valmod.makeKey(key_v, self.arena)) orelse break :blk false;
+                            break :blk found != .null_;
+                        },
+                        .str_ => |st| key_v == .int_ and key_v.int_ >= 0 and key_v.int_ < st.len,
+                        else => false,
+                    } };
+                },
+                .vivify_local => {
+                    switch (f.regs[ins.b]) {
+                        .array_ => |arr| regs[ins.a] = .{ .array_ = arr },
                         .null_ => {
                             const arr = try Value.Array.create(self.arena);
-                            f.locals[instr.arg] = .{ .array_ = arr };
-                            try self.push(.{ .array_ = arr });
+                            f.regs[ins.b] = .{ .array_ = arr };
+                            regs[ins.a] = .{ .array_ = arr };
                         },
                         else => |v| return self.fatalF(line, "cannot use a {s} value as an array", .{v.typeName()}),
                     }
                 },
-                .get_container_global => {
-                    const name = consts[instr.arg].str_;
-                    if (self.globals.get(name)) |v| {
-                        switch (v) {
-                            .array_ => |arr| try self.push(.{ .array_ = arr }),
-                            .null_ => {
-                                const arr = try Value.Array.create(self.arena);
-                                try self.globals.put(self.arena, name, .{ .array_ = arr });
-                                try self.push(.{ .array_ = arr });
-                            },
-                            else => |vv| return self.fatalF(line, "cannot use a {s} value as an array", .{vv.typeName()}),
-                        }
-                    } else {
-                        const arr = try Value.Array.create(self.arena);
-                        try self.globals.put(self.arena, name, .{ .array_ = arr });
-                        try self.push(.{ .array_ = arr });
-                    }
-                },
                 .subcontainer => {
-                    const key = try valmod.makeKey(self.pop(), self.arena);
-                    const parent_val = self.pop();
+                    const parent_val = regs[ins.b];
                     if (parent_val != .array_) {
                         return self.fatalF(line, "cannot use a {s} value as an array", .{parent_val.typeName()});
                     }
+                    if (regs[ins.c] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
                     const parent = parent_val.array_;
+                    const key = try valmod.makeKey(regs[ins.c], self.arena);
                     const existing: ?*Value.Array = blk: {
                         const v = parent.get(key) orelse break :blk null;
                         break :blk switch (v) {
@@ -199,412 +187,204 @@ pub const Vm = struct {
                         try parent.set(self.arena, key, .{ .array_ = arr });
                         break :blk arr;
                     };
-                    try self.push(.{ .array_ = sub });
+                    regs[ins.a] = .{ .array_ = sub };
                 },
 
-                .new_array => {
-                    const n = instr.arg;
-                    const arr = try Value.Array.create(self.arena);
-                    const base = self.stack.items.len - n;
-                    for (self.stack.items[base..]) |v| {
-                        try arr.appendVal(self.arena, v);
-                    }
-                    self.stack.shrinkRetainingCapacity(base);
-                    try self.push(.{ .array_ = arr });
-                },
-                .new_array_kv => {
-                    const pairs = instr.arg;
-                    const arr = try Value.Array.create(self.arena);
-                    const base = self.stack.items.len - 2 * pairs;
-                    var i: usize = base;
-                    while (i < self.stack.items.len) : (i += 2) {
-                        const kv = try valmod.makeKey(self.stack.items[i], self.arena);
-                        try arr.set(self.arena, kv, self.stack.items[i + 1]);
-                    }
-                    self.stack.shrinkRetainingCapacity(base);
-                    try self.push(.{ .array_ = arr });
-                },
-                .get_index => {
-                    const key_v = self.pop();
-                    const container = self.pop();
-                    try self.push(try self.indexRead(container, key_v, line));
-                },
-                .set_index => {
-                    const v = self.pop();
-                    const key_v = self.pop();
-                    const container = self.pop();
-                    if (container != .array_) {
-                        return self.fatalF(line, "cannot use a {s} value as an array", .{container.typeName()});
-                    }
-                    if (key_v == .array_) return self.fatalF(line, "illegal offset type: array", .{});
-                    try container.array_.set(self.arena, try valmod.makeKey(key_v, self.arena), v);
-                    try self.push(v); // assignment expression value
-                },
-                .append_index => {
-                    const v = self.pop();
-                    const container = self.pop();
-                    if (container != .array_) {
-                        return self.fatalF(line, "cannot use a {s} value as an array", .{container.typeName()});
-                    }
-                    try container.array_.appendVal(self.arena, v);
-                    try self.push(v);
-                },
-                .isset_index => {
-                    const key_v = self.pop();
-                    const container = self.pop();
-                    const result: bool = switch (container) {
-                        .null_ => false,
-                        .array_ => |arr| blk: {
-                            if (key_v == .array_) break :blk false;
-                            const found = arr.get(try valmod.makeKey(key_v, self.arena)) orelse break :blk false;
-                            break :blk found != .null_;
-                        },
-                        .str_ => |st| key_v == .int_ and key_v.int_ >= 0 and key_v.int_ < st.len,
-                        else => false,
-                    };
-                    try self.push(.{ .bool_ = result });
-                },
-
-                .add => try self.binOp(.add, line),
-                .sub => try self.binOp(.sub, line),
-                .mul => try self.binOp(.mul, line),
-                .div => try self.binOp(.div, line),
-                .mod => try self.binOp(.mod, line),
-                .pow => try self.binOp(.pow, line),
+                .add => regs[ins.a] = try self.arithRaw(.add, regs[ins.b], regs[ins.c], line),
+                .sub => regs[ins.a] = try self.arithRaw(.sub, regs[ins.b], regs[ins.c], line),
+                .mul => regs[ins.a] = try self.arithRaw(.mul, regs[ins.b], regs[ins.c], line),
+                .div => regs[ins.a] = try self.arithRaw(.div, regs[ins.b], regs[ins.c], line),
+                .mod => regs[ins.a] = try self.arithRaw(.mod, regs[ins.b], regs[ins.c], line),
+                .pow => regs[ins.a] = try self.arithRaw(.pow, regs[ins.b], regs[ins.c], line),
                 .concat => {
-                    const r = try valmod.toString(self.pop(), self.arena);
-                    const l = try valmod.toString(self.pop(), self.arena);
-                    try self.push(.{ .str_ = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ l, r })});
+                    const r = try valmod.toString(regs[ins.c], self.arena);
+                    const l = try valmod.toString(regs[ins.b], self.arena);
+                    regs[ins.a] = .{ .str_ = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ l, r }) };
                 },
 
-                .bit_and => try self.intBin(.bit_and, line),
-                .bit_or => try self.intBin(.bit_or, line),
-                .bit_xor => try self.intBin(.bit_xor, line),
-                .shl => try self.intBin(.shl, line),
-                .shr => try self.intBin(.shr, line),
-                .bit_not => {
-                    const v = self.peek();
-                    if (v == .float_) return self.fatalF(line, "unsupported operand type for ~", .{});
-                    const n = valmod.toNumber(self.pop());
-                    try self.push(.{ .int_ = ~n.int });
-                },
+                .bit_and => regs[ins.a] = try self.intBin(.bit_and, regs[ins.b], regs[ins.c]),
+                .bit_or => regs[ins.a] = try self.intBin(.bit_or, regs[ins.b], regs[ins.c]),
+                .bit_xor => regs[ins.a] = try self.intBin(.bit_xor, regs[ins.b], regs[ins.c]),
+                .shl => regs[ins.a] = try self.intBin(.shl, regs[ins.b], regs[ins.c]),
+                .shr => regs[ins.a] = try self.intBin(.shr, regs[ins.b], regs[ins.c]),
 
-                .eq => try self.cmpOp(.eq, line),
-                .neq => try self.cmpOp(.neq, line),
-                .identical => {
-                    const r = self.pop();
-                    const l = self.pop();
-                    try self.push(.{ .bool_ = valmod.strictEq(l, r) });
-                },
-                .not_identical => {
-                    const r = self.pop();
-                    const l = self.pop();
-                    try self.push(.{ .bool_ = !valmod.strictEq(l, r) });
-                },
-                .lt => try self.cmpOp(.lt, line),
-                .gt => try self.cmpOp(.gt, line),
-                .lte => try self.cmpOp(.lte, line),
-                .gte => try self.cmpOp(.gte, line),
+                .eq => regs[ins.a] = .{ .bool_ = try valmod.looseEq(regs[ins.b], regs[ins.c], self.arena) },
+                .neq => regs[ins.a] = .{ .bool_ = !(try valmod.looseEq(regs[ins.b], regs[ins.c], self.arena)) },
+                .lt => regs[ins.a] = .{ .bool_ = (try valmod.looseCmp(regs[ins.b], regs[ins.c], self.arena)) == .lt },
+                .gt => regs[ins.a] = .{ .bool_ = (try valmod.looseCmp(regs[ins.b], regs[ins.c], self.arena)) == .gt },
+                .lte => regs[ins.a] = .{ .bool_ = (try valmod.looseCmp(regs[ins.b], regs[ins.c], self.arena)) != .gt },
+                .gte => regs[ins.a] = .{ .bool_ = (try valmod.looseCmp(regs[ins.b], regs[ins.c], self.arena)) != .lt },
                 .spaceship => {
-                    const r = self.pop();
-                    const l = self.pop();
-                    const ord = try valmod.looseCmp(l, r, self.arena);
-                    try self.push(.{ .int_ = switch (ord) {
+                    const ord = try valmod.looseCmp(regs[ins.b], regs[ins.c], self.arena);
+                    regs[ins.a] = .{ .int_ = switch (ord) {
                         .lt => @as(i64, -1),
                         .eq => 0,
                         .gt => 1,
-                    } });
+                    } };
                 },
+                .identical => regs[ins.a] = .{ .bool_ = valmod.strictEq(regs[ins.b], regs[ins.c]) },
+                .not_identical => regs[ins.a] = .{ .bool_ = !valmod.strictEq(regs[ins.b], regs[ins.c]) },
 
-                .neg => {
-                    const n = valmod.toNumber(self.pop());
-                    try self.push(switch (n) {
-                        .int => |i| Value{ .int_ = -i },
-                        .float => |fl| Value{ .float_ = -fl },
-                    });
+                .neg => regs[ins.a] = switch (valmod.toNumber(regs[ins.b])) {
+                    .int => |i| Value{ .int_ = -i },
+                    .float => |fl| Value{ .float_ = -fl },
                 },
-                .pos => {
-                    const n = valmod.toNumber(self.pop());
-                    try self.push(switch (n) {
-                        .int => |i| Value{ .int_ = i },
-                        .float => |fl| Value{ .float_ = fl },
-                    });
+                .pos => regs[ins.a] = switch (valmod.toNumber(regs[ins.b])) {
+                    .int => |i| Value{ .int_ = i },
+                    .float => |fl| Value{ .float_ = fl },
                 },
-                .not => {
-                    const v = self.pop();
-                    try self.push(.{ .bool_ = !v.truthy() });
+                .not => regs[ins.a] = .{ .bool_ = !regs[ins.b].truthy() },
+                .to_bool => regs[ins.a] = .{ .bool_ = regs[ins.b].truthy() },
+                .bit_not => {
+                    if (regs[ins.b] == .float_) return self.fatalF(line, "unsupported operand type for ~", .{});
+                    regs[ins.a] = .{ .int_ = ~valmod.toNumber(regs[ins.b]).int };
                 },
-                .to_bool => {
-                    const v = self.pop();
-                    try self.push(.{ .bool_ = v.truthy() });
-                },
-                .is_not_null => {
-                    const v = self.pop();
-                    try self.push(.{ .bool_ = v != .null_ });
-                },
-
-                .jmp => {
-                    f.ip = instr.arg;
-                    continue;
-                },
-                .jmp_if_false => {
-                    if (!self.pop().truthy()) {
-                        f.ip = instr.arg;
-                        continue;
-                    }
-                },
-                .jmp_if_true => {
-                    if (self.pop().truthy()) {
-                        f.ip = instr.arg;
-                        continue;
-                    }
-                },
-                .jmp_if_false_keep => {
-                    if (!self.peek().truthy()) {
-                        self.stack.items[self.stack.items.len - 1] = .{ .bool_ = false };
-                        f.ip = instr.arg;
-                        continue;
-                    }
-                },
-                .jmp_if_true_keep => {
-                    if (self.peek().truthy()) {
-                        self.stack.items[self.stack.items.len - 1] = .{ .bool_ = true };
-                        f.ip = instr.arg;
-                        continue;
-                    }
-                },
-                .jmp_if_true_raw => {
-                    if (self.peek().truthy()) {
-                        f.ip = instr.arg;
-                        continue;
-                    }
-                },
-                .coalesce => {
-                    const rhs = self.pop();
-                    const lhs = self.pop();
-                    try self.push(if (lhs != .null_) lhs else rhs);
-                },
-                .logic_xor => {
-                    const r = self.pop().truthy();
-                    const l = self.pop().truthy();
-                    try self.push(.{ .bool_ = l != r });
-                },
+                .is_not_null => regs[ins.a] = .{ .bool_ = regs[ins.b] != .null_ },
+                .coalesce => regs[ins.a] = if (regs[ins.b] != .null_) regs[ins.b] else regs[ins.c],
 
                 .strconcat => {
-                    const n = instr.arg;
-                    const base = self.stack.items.len - n;
+                    const base = ins.b;
+                    const n = ins.c;
                     var buf: std.ArrayList(u8) = .empty;
-                    for (self.stack.items[base..]) |v| {
+                    for (regs[base .. base + n]) |v| {
                         try buf.appendSlice(self.arena, try valmod.toString(v, self.arena));
                     }
-                    self.stack.shrinkRetainingCapacity(base);
-                    try self.push(.{ .str_ = buf.items });
+                    regs[ins.a] = .{ .str_ = buf.items };
                 },
                 .echo => {
-                    const n = instr.arg;
-                    const base = self.stack.items.len - n;
-                    for (self.stack.items[base..]) |v| {
+                    const base = ins.a;
+                    const n = ins.b;
+                    for (regs[base .. base + n]) |v| {
                         try self.out.writeAll(try valmod.toString(v, self.arena));
                     }
-                    self.stack.shrinkRetainingCapacity(base);
                 },
 
-                .pre_inc_local => try self.incLocalSlot(f, instr.arg, true, true),
-                .post_inc_local => try self.incLocalSlot(f, instr.arg, true, false),
-                .pre_dec_local => try self.incLocalSlot(f, instr.arg, false, true),
-                .post_dec_local => try self.incLocalSlot(f, instr.arg, false, false),
-                .pre_inc_global => try self.incGlobal(consts[instr.arg].str_, true, true),
-                .post_inc_global => try self.incGlobal(consts[instr.arg].str_, true, false),
-                .pre_dec_global => try self.incGlobal(consts[instr.arg].str_, false, true),
-                .post_dec_global => try self.incGlobal(consts[instr.arg].str_, false, false),
-                .pre_inc_index => try self.incIndex(true, true, line),
-                .post_inc_index => try self.incIndex(true, false, line),
-                .pre_dec_index => try self.incIndex(false, true, line),
-                .post_dec_index => try self.incIndex(false, false, line),
+                .inc_l => regs[ins.a] = incValue(regs[ins.a], true),
+                .dec_l => regs[ins.a] = incValue(regs[ins.a], false),
+                .post_inc_l => {
+                    const old = regs[ins.b];
+                    regs[ins.b] = incValue(old, true);
+                    regs[ins.a] = old;
+                },
+                .post_dec_l => {
+                    const old = regs[ins.b];
+                    regs[ins.b] = incValue(old, false);
+                    regs[ins.a] = old;
+                },
+                .inc_idx, .dec_idx => {
+                    const up = ins.op == .inc_idx;
+                    const container = try self.wantArray(regs[ins.a], line);
+                    if (regs[ins.b] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
+                    const key = try valmod.makeKey(regs[ins.b], self.arena);
+                    const old = container.get(key) orelse .null_;
+                    try container.set(self.arena, key, incValue(old, up));
+                },
+                .post_inc_idx, .post_dec_idx => {
+                    const up = ins.op == .post_inc_idx;
+                    const container = try self.wantArray(regs[ins.b], line);
+                    if (regs[ins.c] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
+                    const key = try valmod.makeKey(regs[ins.c], self.arena);
+                    const old = container.get(key) orelse .null_;
+                    regs[ins.a] = old;
+                    try container.set(self.arena, key, incValue(old, up));
+                },
 
                 .call => {
-                    const name_const = opcode.unpackCallName(instr.arg);
-                    const argc = opcode.unpackCallArgc(instr.arg);
-                    try self.doCall(consts[name_const].str_, argc, line);
+                    // a = argc, b = args base register, c = name const index
+                    try self.doCall(consts[ins.c].str_, ins.a, ins.b, line);
                     return; // re-derive frame in dispatch()
                 },
                 .return_val => {
-                    const result = self.pop();
-                    try self.popFrame(result);
-                    return; // re-derive / unwind in runFrame
+                    try self.popFrame(regs[ins.a]);
+                    return;
                 },
                 .return_null => {
                     try self.popFrame(.null_);
                     return;
                 },
 
-                .foreach_init => try self.foreachInit(instr.arg, line),
+                .foreach_init => {
+                    const subject = regs[ins.c];
+                    const snap: Value = switch (subject) {
+                        .array_ => subject,
+                        .null_ => .{ .array_ = try Value.Array.create(self.arena) },
+                        else => return self.fatalF(line, "foreach() argument must be of type array, {s} given", .{subject.typeName()}),
+                    };
+                    f.hidden[ins.a] = snap;
+                    f.hidden[ins.b] = .{ .int_ = 0 };
+                },
                 .foreach_next => {
-                    // Loop-exit target lives in the following inline word.
-                    const end_target = code[f.ip].arg; // already points past the inline word
-                    if (try self.foreachAdvance(instr.arg)) {
-                        f.ip = end_target;
-                        continue;
-                    }
-                    f.ip += 1; // skip inline word on fallthrough
-                },
+                    const packed_arg = code[f.ip].a; // inline word 1
+                    const target = code[f.ip + 1].a; // inline word 2
+                    f.ip += 2;
 
-                .isset_local => try self.push(.{ .bool_ = f.locals[instr.arg] != .null_ }),
-                .isset_global => {
-                    const v = self.globals.get(consts[instr.arg].str_) orelse .null_;
-                    try self.push(.{ .bool_ = v != .null_ });
-                },
+                    const hid = opcode.unpackForeachHidden(packed_arg);
+                    const has_key = opcode.unpackForeachHasKey(packed_arg);
+                    const snapshot = f.hidden[hid].array_.entries.items;
+                    const i: usize = @intCast(f.hidden[hid + 1].int_);
 
-                // -- fused superinstructions ---------------------------------------------------
-                .add_set_local_local => {
-                    const dst = instr.arg & 0xFFFF;
-                    const src = instr.arg >> 16;
-                    f.locals[dst] = try self.arithRaw(.add, f.locals[dst], f.locals[src], line);
-                },
-                .sub_set_local_local => {
-                    const dst = instr.arg & 0xFFFF;
-                    const src = instr.arg >> 16;
-                    f.locals[dst] = try self.arithRaw(.sub, f.locals[dst], f.locals[src], line);
-                },
-                .add_set_local_const => {
-                    const dst = instr.arg & 0xFFFF;
-                    f.locals[dst] = try self.arithRaw(.add, f.locals[dst], consts[instr.arg >> 16], line);
-                },
-                .sub_set_local_const => {
-                    const dst = instr.arg & 0xFFFF;
-                    f.locals[dst] = try self.arithRaw(.sub, f.locals[dst], consts[instr.arg >> 16], line);
-                },
-                .post_inc_local_discard => {
-                    _ = try self.incLocalSlot(f, instr.arg, true, false);
-                    _ = self.pop();
-                },
-                .post_dec_local_discard => {
-                    _ = try self.incLocalSlot(f, instr.arg, false, false);
-                    _ = self.pop();
-                },
-                .cmp_jmp_local_local => {
-                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((instr.arg >> 26) & 0x7)));
-                    const a = instr.arg & 0x1FFF;
-                    const b = (instr.arg >> 13) & 0x1FFF;
-                    const target = code[f.ip].arg; // inline word
-                    if (!(try self.cmpBool(cmpSelToKind(sel), f.locals[a], f.locals[b]))) {
+                    if (i >= snapshot.len) {
                         f.ip = target;
                         continue;
                     }
-                    f.ip += 1; // skip inline word on fallthrough
+                    const entry = snapshot[i];
+                    f.hidden[hid + 1] = .{ .int_ = @intCast(i + 1) };
+                    if (has_key and ins.a != opcode.no_reg) {
+                        regs[ins.a] = entry.key.toValue();
+                    } else if (!has_key and ins.a != opcode.no_reg) {
+                        return self.fatalF(line, "internal: unexpected key binding", .{});
+                    }
+                    regs[ins.b] = entry.val;
+                    continue;
                 },
-                .cmp_jmp_local_const => {
-                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((instr.arg >> 24) & 0x7)));
-                    const slot = instr.arg & 0xFFFFFF;
-                    const const_idx = code[f.ip].arg; // first inline word
-                    const target = code[f.ip + 1].arg; // second inline word
-                    if (!(try self.cmpBool(cmpSelToKind(sel), f.locals[slot], consts[const_idx]))) {
+
+                .isset_local => regs[ins.a] = .{ .bool_ = f.regs[ins.b] != .null_ },
+
+                .jmp => {
+                    f.ip = ins.a;
+                    continue;
+                },
+                .jmp_if_false => {
+                    if (!regs[ins.a].truthy()) {
+                        f.ip = ins.b;
+                        continue;
+                    }
+                },
+                .jmp_if_true => {
+                    if (regs[ins.a].truthy()) {
+                        f.ip = ins.b;
+                        continue;
+                    }
+                },
+                .if_cmp_jmp_ll => {
+                    // arg = sel<<26 | b_slot<<13 | a_slot
+                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((ins.a >> 26) & 0x7)));
+                    const ra = ins.a & 0x1FFF;
+                    const rb = (ins.a >> 13) & 0x1FFF;
+                    const target = code[f.ip].a; // inline word
+                    f.ip += 1;
+                    if (!(try self.cmpBool(cmpSelToKind(sel), regs[ra], regs[rb]))) {
                         f.ip = target;
                         continue;
                     }
-                    f.ip += 2; // skip both inline words
+                    continue;
+                },
+                .if_cmp_jmp_lc => {
+                    // arg = sel<<24 | slot; inline1 = const idx; inline2 = target
+                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((ins.a >> 24) & 0x7)));
+                    const slot = ins.a & 0xFFFFFF;
+                    const const_idx = code[f.ip].a;
+                    const target = code[f.ip + 1].a;
+                    f.ip += 2;
+                    if (!(try self.cmpBool(cmpSelToKind(sel), regs[slot], consts[const_idx]))) {
+                        f.ip = target;
+                        continue;
+                    }
+                    continue;
                 },
             }
         }
     }
-
-    // -- helpers -------------------------------------------------------------------
-
-    const ArithKind = enum { add, sub, mul, div, mod, pow };
-    const BitKind = enum { bit_and, bit_or, bit_xor, shl, shr };
-
-    fn binOp(self: *Vm, kind: ArithKind, line: u32) Error!void {
-        const r = self.pop();
-        const l = self.pop();
-        try self.push(try self.arithRaw(kind, l, r, line));
-    }
-
-    /// Arithmetic returning a value (shared by stack ops and fused
-    /// compound-assign instructions).
-    fn arithRaw(self: *Vm, kind: ArithKind, l: Value, r: Value, line: u32) Error!Value {
-        if (l == .array_ or r == .array_) {
-            return self.fatalF(line, "unsupported operand types: {s} and {s}", .{ l.typeName(), r.typeName() });
-        }
-        const ln = valmod.toNumber(l);
-        const rn = valmod.toNumber(r);
-
-        // Integer fast path.
-        if (ln == .int and rn == .int) {
-            const a = ln.int;
-            const b = rn.int;
-            switch (kind) {
-                .add => {
-                    const res = @addWithOverflow(a, b);
-                    if (res[1] == 0) return .{ .int_ = res[0] };
-                    return .{ .float_ = @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)) };
-                },
-                .sub => {
-                    const res = @subWithOverflow(a, b);
-                    if (res[1] == 0) return .{ .int_ = res[0] };
-                    return .{ .float_ = @as(f64, @floatFromInt(a)) - @as(f64, @floatFromInt(b)) };
-                },
-                .mul => {
-                    const res = @mulWithOverflow(a, b);
-                    if (res[1] == 0) return .{ .int_ = res[0] };
-                    return .{ .float_ = @as(f64, @floatFromInt(a)) * @as(f64, @floatFromInt(b)) };
-                },
-                .div => {
-                    if (b == 0) return self.fatalF(line, "Division by zero", .{});
-                    if (@rem(a, b) == 0) return .{ .int_ = @divTrunc(a, b) };
-                    return .{ .float_ = @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b)) };
-                },
-                .mod => {
-                    if (b == 0) return self.fatalF(line, "Modulo by zero", .{});
-                    return .{ .int_ = @rem(a, b) };
-                },
-                .pow => {
-                    if (b >= 0 and b <= 62) {
-                        var result: i64 = 1;
-                        var i: i64 = 0;
-                        while (i < b) : (i += 1) result *|= a;
-                        return .{ .int_ = result };
-                    }
-                    return .{ .float_ = std.math.pow(f64, @floatFromInt(a), @floatFromInt(b)) };
-                },
-            }
-        }
-
-        // Float path.
-        const a = ln.toFloat();
-        const b = rn.toFloat();
-        return switch (kind) {
-            .add => .{ .float_ = a + b },
-            .sub => .{ .float_ = a - b },
-            .mul => .{ .float_ = a * b },
-            .div => blk: {
-                if (b == 0.0) return self.fatalF(line, "Division by zero", .{});
-                break :blk Value{ .float_ = a / b };
-            },
-            .mod => blk: {
-                if (b == 0.0) return self.fatalF(line, "Modulo by zero", .{});
-                break :blk Value{ .int_ = @rem(@as(i64, @intFromFloat(@trunc(a))), @as(i64, @intFromFloat(@trunc(b)))) };
-            },
-            .pow => .{ .float_ = std.math.pow(f64, a, b) },
-        };
-    }
-
-    fn intBin(self: *Vm, kind: BitKind, line: u32) Error!void {
-        _ = line;
-        const rv = self.pop();
-        const lv = self.pop();
-        const li = valmod.toNumber(lv).int;
-        const ri = valmod.toNumber(rv).int;
-        const result: i64 = switch (kind) {
-            .bit_and => li & ri,
-            .bit_or => li | ri,
-            .bit_xor => li ^ ri,
-            .shl => if (ri < 0 or ri > 63) 0 else li << @intCast(ri),
-            .shr => if (ri < 0 or ri > 63) (if (li < 0) @as(i64, -1) else 0) else li >> @intCast(ri),
-        };
-        try self.push(.{ .int_ = result });
-    }
-
-    const CmpKind = enum { eq, neq, lt, gt, lte, gte };
 
     fn cmpSelToKind(sel: opcode.CmpSel) CmpKind {
         return switch (sel) {
@@ -628,22 +408,25 @@ pub const Vm = struct {
         };
     }
 
-    fn cmpOp(self: *Vm, kind: CmpKind, line: u32) Error!void {
-        _ = line;
-        const r = self.pop();
-        const l = self.pop();
-        try self.push(.{ .bool_ = try self.cmpBool(kind, l, r) });
+    const CmpKind = enum { eq, neq, lt, gt, lte, gte };
+
+    const ArithKind = enum { add, sub, mul, div, mod, pow };
+    const BitKind = enum { bit_and, bit_or, bit_xor, shl, shr };
+
+    fn wantArray(self: *Vm, v: Value, line: u32) Error!*Value.Array {
+        return switch (v) {
+            .array_ => |arr| arr,
+            else => self.fatalF(line, "cannot use a {s} value as an array", .{v.typeName()}),
+        };
     }
 
-    fn indexRead(self: *Vm, container: Value, key_v: Value, line: u32) Error!Value {
-        switch (container) {
+    fn indexRead(self: *Vm, base: Value, key_v: Value, line: u32) Error!Value {
+        switch (base) {
             .array_ => |arr| {
                 if (key_v == .array_) return self.fatalF(line, "illegal offset type: array", .{});
                 return arr.get(try valmod.makeKey(key_v, self.arena)) orelse .null_;
             },
             .str_ => |st| {
-                // Only numeric offsets index strings; anything else reads as
-                // "" (matching the reference engine; PHP warns).
                 if (key_v != .int_ and key_v != .float_) return .{ .str_ = "" };
                 const fl = valmod.toNumber(key_v).toFloat();
                 if (fl < 0 or fl >= @as(f64, @floatFromInt(st.len))) return .{ .str_ = "" };
@@ -651,37 +434,87 @@ pub const Vm = struct {
                 return .{ .str_ = st[i .. i + 1] };
             },
             .null_ => return .null_,
-            else => return self.fatalF(line, "cannot use {s} value as array", .{container.typeName()}),
+            else => return self.fatalF(line, "cannot use {s} value as array", .{base.typeName()}),
         }
     }
 
-    fn incLocalSlot(self: *Vm, f: *Frame, slot: usize, up: bool, pre: bool) Error!void {
-        const next = incValue(f.locals[slot], up);
-        const old = f.locals[slot];
-        f.locals[slot] = next;
-        try self.push(if (pre) next else old);
-    }
-
-    fn incGlobal(self: *Vm, name: []const u8, up: bool, pre: bool) Error!void {
-        const old = self.globals.get(name) orelse .null_;
-        const next = incValue(old, up);
-        try self.globals.put(self.arena, name, next);
-        try self.push(if (pre) next else old);
-    }
-
-    fn incIndex(self: *Vm, up: bool, pre: bool, line: u32) Error!void {
-        const key_v = self.pop();
-        const container = self.pop();
-        if (container != .array_) {
-            return self.fatalF(line, "cannot use a {s} value as an array", .{container.typeName()});
+    fn arithRaw(self: *Vm, kind: ArithKind, l: Value, r: Value, line: u32) Error!Value {
+        if (l == .array_ or r == .array_) {
+            return self.fatalF(line, "unsupported operand types: {s} and {s}", .{ l.typeName(), r.typeName() });
         }
-        if (key_v == .array_) return self.fatalF(line, "illegal offset type: array", .{});
-        const key = try valmod.makeKey(key_v, self.arena);
-        const arr = container.array_;
-        const old = arr.get(key) orelse .null_;
-        const next = incValue(old, up);
-        try arr.set(self.arena, key, next);
-        try self.push(if (pre) next else old);
+        const ln = valmod.toNumber(l);
+        const rn = valmod.toNumber(r);
+
+        if (ln == .int and rn == .int) {
+            const x = ln.int;
+            const y = rn.int;
+            switch (kind) {
+                .add => {
+                    const res = @addWithOverflow(x, y);
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(x)) + @as(f64, @floatFromInt(y)) };
+                },
+                .sub => {
+                    const res = @subWithOverflow(x, y);
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(x)) - @as(f64, @floatFromInt(y)) };
+                },
+                .mul => {
+                    const res = @mulWithOverflow(x, y);
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(x)) * @as(f64, @floatFromInt(y)) };
+                },
+                .div => {
+                    if (y == 0) return self.fatalF(line, "Division by zero", .{});
+                    if (@rem(x, y) == 0) return .{ .int_ = @divTrunc(x, y) };
+                    return .{ .float_ = @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y)) };
+                },
+                .mod => {
+                    if (y == 0) return self.fatalF(line, "Modulo by zero", .{});
+                    return .{ .int_ = @rem(x, y) };
+                },
+                .pow => {
+                    if (y >= 0 and y <= 62) {
+                        var result: i64 = 1;
+                        var i: i64 = 0;
+                        while (i < y) : (i += 1) result *|= x;
+                        return .{ .int_ = result };
+                    }
+                    return .{ .float_ = std.math.pow(f64, @floatFromInt(x), @floatFromInt(y)) };
+                },
+            }
+        }
+
+        const x = ln.toFloat();
+        const y = rn.toFloat();
+        return switch (kind) {
+            .add => .{ .float_ = x + y },
+            .sub => .{ .float_ = x - y },
+            .mul => .{ .float_ = x * y },
+            .div => blk: {
+                if (y == 0.0) return self.fatalF(line, "Division by zero", .{});
+                break :blk Value{ .float_ = x / y };
+            },
+            .mod => blk: {
+                if (y == 0.0) return self.fatalF(line, "Modulo by zero", .{});
+                break :blk Value{ .int_ = @rem(@as(i64, @intFromFloat(@trunc(x))), @as(i64, @intFromFloat(@trunc(y)))) };
+            },
+            .pow => .{ .float_ = std.math.pow(f64, x, y) },
+        };
+    }
+
+    fn intBin(self: *Vm, kind: BitKind, l: Value, r: Value) Error!Value {
+        _ = self;
+        const li = valmod.toNumber(l).int;
+        const ri = valmod.toNumber(r).int;
+        const result: i64 = switch (kind) {
+            .bit_and => li & ri,
+            .bit_or => li | ri,
+            .bit_xor => li ^ ri,
+            .shl => if (ri < 0 or ri > 63) 0 else li << @intCast(ri),
+            .shr => if (ri < 0 or ri > 63) (if (li < 0) @as(i64, -1) else 0) else li >> @intCast(ri),
+        };
+        return .{ .int_ = result };
     }
 
     fn incValue(old: Value, up: bool) Value {
@@ -698,37 +531,7 @@ pub const Vm = struct {
         };
     }
 
-    fn foreachInit(self: *Vm, temp: u32, line: u32) Error!void {
-        const subject = self.pop();
-        const f = &self.frames.items[self.frames.items.len - 1];
-        if (subject == .null_) {
-            f.temps[temp] = .{ .array_ = try Value.Array.create(self.arena) };
-        } else if (subject == .array_) {
-            f.temps[temp] = subject;
-        } else {
-            return self.fatalF(line, "foreach() argument must be of type array, {s} given", .{subject.typeName()});
-        }
-        f.temps[temp + 1] = .{ .int_ = 0 };
-    }
-
-    /// Advance the iterator; pushes [key?] value when items remain.
-    /// Returns true when exhausted (caller jumps).
-    fn foreachAdvance(self: *Vm, packed_arg: u32) Error!bool {
-        const temp = opcode.unpackForeachTemp(packed_arg);
-        const has_key = opcode.unpackForeachHasKey(packed_arg);
-        const f = &self.frames.items[self.frames.items.len - 1];
-        const snapshot = f.temps[temp].array_.entries.items;
-        const i: usize = @intCast(f.temps[temp + 1].int_);
-        if (i >= snapshot.len) return true;
-
-        const entry = snapshot[i];
-        f.temps[temp + 1] = .{ .int_ = @intCast(i + 1) };
-        if (has_key) try self.push(entry.key.toValue());
-        try self.push(entry.val);
-        return false;
-    }
-
-    fn doCall(self: *Vm, name: []const u8, argc: u32, line: u32) Error!void {
+    fn doCall(self: *Vm, name: []const u8, argc: u32, base_reg: u32, line: u32) Error!void {
         if (self.funcs.get(name)) |callee| {
             if (argc > callee.arity) {
                 return self.fatalF(line, "{s}() expects at most {d} argument(s), {d} given", .{ name, callee.arity, argc });
@@ -737,22 +540,16 @@ pub const Vm = struct {
                 return self.fatalF(line, "Maximum function nesting level of {d} reached, aborting", .{MAX_CALL_DEPTH});
             }
 
-            // Move args from the operand stack into the new frame's locals.
-            const stack_base = self.stack.items.len - argc;
-            const args = try self.arena.dupe(Value, self.stack.items[stack_base..]);
-            self.stack.shrinkRetainingCapacity(stack_base);
+            const caller = &self.frames.items[self.frames.items.len - 1];
+            const args = try self.arena.dupe(Value, caller.regs[base_reg .. base_reg + argc]);
 
-            const nslots = @max(callee.nlocals, callee.arity);
-            const locals = try self.arena.alloc(Value, nslots);
-            for (locals) |*l| l.* = .null_;
-            for (args, 0..) |a, i| locals[i] = a;
-            // Constant defaults for missing params.
+            const callee_regs = try self.newFrameRegs(callee);
+            for (args, 0..) |av, i| callee_regs[i] = av;
             var i: usize = argc;
             while (i < callee.arity) : (i += 1) {
                 if (i < callee.defaults.len) {
-                    locals[i] = callee.defaults[i] orelse {
+                    callee_regs[i] = callee.defaults[i] orelse
                         return self.fatalF(line, "Too few arguments to function {s}()", .{name});
-                    };
                 } else {
                     return self.fatalF(line, "Too few arguments to function {s}()", .{name});
                 }
@@ -761,25 +558,21 @@ pub const Vm = struct {
             try self.frames.append(self.arena, .{
                 .func = callee,
                 .ip = 0,
-                .locals = locals,
-                .temps = try self.arena.alloc(Value, callee.ntemps),
-                .stack_base = self.stack.items.len,
+                .regs = callee_regs,
+                .hidden = try self.arena.alloc(Value, callee.nhidden),
+                .result_reg = base_reg, // written back into caller's registers
             });
 
-            // Execute the callee to completion (recursion into dispatch).
-            // Depth is bounded by MAX_CALL_DEPTH so native-stack recursion
-            // stays within limits.
+            // Execute callee to completion; depth bounded by MAX_CALL_DEPTH.
             try self.dispatch();
             return;
         }
 
-        // Builtins receive a view of the operand stack.
-        if (argc > 255) return self.fatalF(line, "too many arguments", .{});
-        const stack_base = self.stack.items.len - argc;
-        const args = self.stack.items[stack_base..];
+        // Builtins receive a view of the caller's registers.
+        const caller = &self.frames.items[self.frames.items.len - 1];
+        const args = caller.regs[base_reg .. base_reg + argc];
         if (try builtins.call(self, name, args, line)) |result| {
-            self.stack.shrinkRetainingCapacity(stack_base);
-            try self.push(result);
+            caller.regs[base_reg] = result;
             return;
         }
 
@@ -788,8 +581,9 @@ pub const Vm = struct {
 
     fn popFrame(self: *Vm, result: Value) Error!void {
         const frame = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(frame.stack_base);
-        // Leave the result for the caller (or as script result at top level).
-        try self.push(result);
+        if (self.frames.items.len > 0 and frame.result_reg != opcode.no_reg) {
+            const caller = &self.frames.items[self.frames.items.len - 1];
+            caller.regs[frame.result_reg] = result;
+        }
     }
 };

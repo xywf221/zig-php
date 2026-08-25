@@ -33,9 +33,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn dumpFn(out: *std.Io.Writer, name: []const u8, f: anytype) !void {
-    try out.print("; ---- {s} (arity={d}, nlocals={d}) ----\n", .{ name, f.arity, f.nlocals });
+    try out.print("; ---- {s} (arity={d}, nlocals={d}, ntemps={d}) ----\n", .{ name, f.arity, f.nlocals, f.ntemps });
     for (f.chunk.code.items, 0..) |ins, i| {
-        try out.print("{d: >4} {s} {d}\n", .{ i, @tagName(ins.op), ins.arg });
+        try out.print("{d: >4} {s} a={d} b={d} c={d}\n", .{ i, @tagName(ins.op), ins.a, ins.b, ins.c });
     }
     for (f.chunk.consts.items, 0..) |c, i| {
         switch (c) {

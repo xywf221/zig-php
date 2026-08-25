@@ -1,9 +1,15 @@
-//! Bytecode compiler: AST -> stack-machine bytecode.
+//! Register bytecode compiler: AST -> three-address code.
+//!
+//! Code generation is *target-directed*: `compileInto(dst, expr)` emits code
+//! that leaves the expression's value in register `dst`, eliminating all
+//! operand-stack shuffling. Locals live in fixed registers; temporaries are
+//! allocated from a free list above them.
 //!
 //! Scope model (matching PHP):
-//!   * the top-level script reads/writes the globals map,
-//!   * each function body gets fresh local slots,
-//!   * foreach iterators live in per-frame temp slot pairs.
+//!   * the top-level script is an ordinary function frame — its variables
+//!     are registers (invisible to called functions, since the minimal core
+//!     has no `global` keyword),
+//!   * each declared function gets a fresh register file.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -23,26 +29,21 @@ pub const Diag = struct {
     line: u32 = 0,
 };
 
-/// Compiled program: top-level script + all function units.
 pub const Program = struct {
     main_func: *Func,
     funcs: std.StringHashMapUnmanaged(*Func) = .empty,
 };
 
 pub const Compiler = struct {
-    arena: std.mem.Allocator,
-    diag: *Diag,
-    ctx: *FnCtx,
-    chunk: *Chunk,
-    loops: std.ArrayList(*LoopCtx) = .empty,
-
-    /// Per-function-unit compilation state.
     const FnCtx = struct {
         func: *Func,
         locals: std.StringHashMapUnmanaged(usize) = .empty,
-        ntemps: u32 = 0,
-        is_global_scope: bool,
+        next_temp: u32 = 0,
+        free_list: std.ArrayList(u32) = .empty,
+        nhidden: u32 = 0,
+        arena: std.mem.Allocator,
 
+        /// Reserve a local slot (pre-pass) or look it up (codegen).
         fn resolveLocal(self: *FnCtx, a: std.mem.Allocator, name: []const u8) Error!usize {
             if (self.locals.get(name)) |s| return s;
             const slot = self.locals.count();
@@ -51,45 +52,170 @@ pub const Compiler = struct {
             return slot;
         }
 
-        fn newTemp(self: *FnCtx) u32 {
-            const t = self.ntemps;
-            self.ntemps += 2; // snapshot + cursor
-            self.func.ntemps = self.ntemps;
-            return t;
+        fn alloc(self: *FnCtx) u32 {
+            if (self.free_list.items.len > 0) return self.free_list.pop().?;
+            const r = self.next_temp;
+            self.next_temp += 1;
+            self.func.ntemps = self.next_temp;
+            return r;
+        }
+
+        fn freeReg(self: *FnCtx, r: u32) void {
+            self.free_list.append(self.arena, r) catch {};
+        }
+
+        fn allocBlock(self: *FnCtx, n: usize) u32 {
+            const base = self.next_temp;
+            self.next_temp += @intCast(n);
+            self.func.ntemps = self.next_temp;
+            return base;
+        }
+
+        fn freeBlock(self: *FnCtx, base: u32, n: usize) void {
+            var i: usize = n;
+            while (i > 0) : (i -= 1) {
+                self.free_list.append(self.arena, base + @as(u32, @intCast(i)) - 1) catch {};
+            }
+        }
+
+        fn newHidden(self: *FnCtx) u32 {
+            const h = self.nhidden;
+            self.nhidden += 2; // snapshot + cursor
+            self.func.nhidden = self.nhidden;
+            return h;
+        }
+    };
+
+    /// An evaluated operand: either a live register or an owning temporary.
+    const Reg = struct {
+        reg: u32,
+        owned: bool,
+
+        fn release(self: Reg, ctx: **FnCtx) void {
+            if (self.owned) ctx.*.freeReg(self.reg);
         }
     };
 
     const LoopCtx = struct {
-        /// Where `continue` jumps: condition re-test for while/do-while/for,
-        /// iterator advance for foreach.
         continue_addr: usize = 0,
         is_foreach: bool = false,
-        next_addr: usize = 0, // foreach_next instruction index
+        next_addr: usize = 0,
         continue_jumps: std.ArrayList(usize) = .empty,
         break_jumps: std.ArrayList(usize) = .empty,
     };
 
+    arena: std.mem.Allocator,
+    diag: *Diag,
+    ctx: *FnCtx,
+    chunk: *Chunk,
+    loops: std.ArrayList(*LoopCtx) = .empty,
+
     // -- entry points ------------------------------------------------------------
+
+    /// Pre-pass: collect every variable name so local slots are known before
+    /// codegen starts — temporaries must never overlap them.
+    fn reserveLocals(arena: std.mem.Allocator, stmts: []const *ast.Stmt, ctx: *FnCtx) Error!void {
+        for (stmts) |s| try reserveLocalsStmt(arena, s, ctx);
+    }
+
+    fn reserveLocalsStmt(arena: std.mem.Allocator, st: *ast.Stmt, ctx: *FnCtx) Error!void {
+        switch (st.kind) {
+            .expr => |e| try reserveLocalsExpr(arena, e, ctx),
+            .echo => |exprs| for (exprs) |e| try reserveLocalsExpr(arena, e, ctx),
+            .block => |stmts| try reserveLocals(arena, stmts, ctx),
+            .if_stmt => |info| {
+                for (info.branches) |b| {
+                    try reserveLocalsExpr(arena, b.cond, ctx);
+                    try reserveLocalsStmt(arena, b.body, ctx);
+                }
+                if (info.else_body) |eb| try reserveLocalsStmt(arena, eb, ctx);
+            },
+            .while_stmt => |w| {
+                try reserveLocalsExpr(arena, w.cond, ctx);
+                try reserveLocalsStmt(arena, w.body, ctx);
+            },
+            .do_while => |dw| {
+                try reserveLocalsStmt(arena, dw.body, ctx);
+                try reserveLocalsExpr(arena, dw.cond, ctx);
+            },
+            .for_stmt => |f| {
+                for (f.init) |e| try reserveLocalsExpr(arena, e, ctx);
+                if (f.cond) |c2| try reserveLocalsExpr(arena, c2, ctx);
+                for (f.step) |e| try reserveLocalsExpr(arena, e, ctx);
+                try reserveLocalsStmt(arena, f.body, ctx);
+            },
+            .foreach => |fe| {
+                try reserveLocalsExpr(arena, fe.subject, ctx);
+                if (fe.key) |k| _ = try ctx.resolveLocal(arena, k);
+                _ = try ctx.resolveLocal(arena, fe.val);
+                try reserveLocalsStmt(arena, fe.body, ctx);
+            },
+            .ret => |e| if (e) |x| try reserveLocalsExpr(arena, x, ctx),
+            else => {},
+        }
+    }
+
+    fn reserveLocalsExpr(arena: std.mem.Allocator, e: *ast.Expr, ctx: *FnCtx) Error!void {
+        switch (e.kind) {
+            .var_ref => |name| _ = try ctx.resolveLocal(arena, name),
+            .interp_str => |parts| {
+                for (parts) |part| {
+                    switch (part) {
+                        .var_ref => |name| _ = try ctx.resolveLocal(arena, name),
+                        .var_index => |vi| _ = try ctx.resolveLocal(arena, vi.name),
+                        .literal => {},
+                    }
+                }
+            },
+            .array_lit => |items| {
+                for (items) |item| {
+                    if (item.key) |ke| try reserveLocalsExpr(arena, ke, ctx);
+                    try reserveLocalsExpr(arena, item.val, ctx);
+                }
+            },
+            .unary => |u| try reserveLocalsExpr(arena, u.operand, ctx),
+            .binary => |b| {
+                try reserveLocalsExpr(arena, b.lhs, ctx);
+                try reserveLocalsExpr(arena, b.rhs, ctx);
+            },
+            .ternary => |tn| {
+                try reserveLocalsExpr(arena, tn.cond, ctx);
+                if (tn.then) |t| try reserveLocalsExpr(arena, t, ctx);
+                try reserveLocalsExpr(arena, tn.els, ctx);
+            },
+            .assign => |a| {
+                try reserveLocalsExpr(arena, a.target, ctx);
+                try reserveLocalsExpr(arena, a.value, ctx);
+            },
+            .inc_dec => |d| try reserveLocalsExpr(arena, d.target, ctx),
+            .call => |c| {
+                for (c.args) |arg| try reserveLocalsExpr(arena, arg, ctx);
+            },
+            .index => |ix| {
+                try reserveLocalsExpr(arena, ix.base, ctx);
+                if (ix.index) |ie| try reserveLocalsExpr(arena, ie, ctx);
+            },
+            .isset => |exprs| for (exprs) |x| try reserveLocalsExpr(arena, x, ctx),
+            .empty => |x| try reserveLocalsExpr(arena, x, ctx),
+            else => {}, // literals contain no variables
+        }
+    }
 
     pub fn compile(arena: std.mem.Allocator, prog_ast: []const *ast.Stmt, diag: *Diag) Error!*Program {
         const program = try arena.create(Program);
 
-        // Top-level unit.
         const main_func = try arena.create(Func);
         main_func.* = .{ .name = "<main>", .arity = 0 };
-        // Top-level variables live in the main frame's slots rather than the
-        // globals map: PHP scoping keeps them invisible to functions anyway
-        // (no \ keyword in the minimal core), and slot access avoids
-        // a hash lookup per variable operation in hot loops.
-        var main_ctx = FnCtx{ .func = main_func, .is_global_scope = false };
+        var main_ctx = FnCtx{ .func = main_func, .arena = arena };
+        try reserveLocals(arena, prog_ast, &main_ctx);
+        main_ctx.next_temp = @intCast(main_func.nlocals);
         {
             var c = Compiler{ .arena = arena, .diag = diag, .ctx = &main_ctx, .chunk = &main_func.chunk };
             try c.compileStmts(prog_ast);
-            _ = try c.rawEmit(.return_null, 0);
+            _ = try c.emit(.return_null, 0);
         }
         program.* = .{ .main_func = main_func };
 
-        // Function units.
         try collectFuncs(arena, prog_ast, program, diag);
         return program;
     }
@@ -98,8 +224,6 @@ pub const Compiler = struct {
         for (stmts) |s| try collectFuncsStmt(arena, s, program, diag);
     }
 
-    /// Walk every statement tree — functions may be declared conditionally
-    /// or nested inside other functions.
     fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag) Error!void {
         switch (st.kind) {
             .func_decl => |fd| {
@@ -141,46 +265,56 @@ pub const Compiler = struct {
             }
         }
 
-        var ctx = FnCtx{ .func = f, .is_global_scope = false };
-        var c = Compiler{ .arena = arena, .diag = diag, .ctx = &ctx, .chunk = &f.chunk };
-        // Pre-declare parameter slots so argument binding order matches.
+        var ctx = FnCtx{ .func = f, .arena = arena };
+        // Parameters occupy the first registers.
         for (fd.params) |p| _ = try ctx.resolveLocal(arena, p.name);
+        try reserveLocals(arena, fd.body, &ctx);
+        ctx.next_temp = @intCast(f.nlocals);
+        var c = Compiler{ .arena = arena, .diag = diag, .ctx = &ctx, .chunk = &f.chunk };
         try c.compileStmts(fd.body);
-        _ = try c.rawEmit(.return_null, 0);
+        _ = try c.emit(.return_null, 0);
         return f;
     }
 
-    // -- low-level emit helpers -----------------------------------------------------
-
-    fn rawEmit(self: *Compiler, op: Op, line: u32) Error!usize {
-        _ = self.chunk.emitArg(self.arena, op, 0, line) catch return error.OutOfMemory;
-        return self.chunk.code.items.len - 1;
-    }
+    // -- low-level emit helpers ------------------------------------------------------
 
     fn emit(self: *Compiler, op: Op, line: u32) Error!usize {
-        return self.emitArg(op, 0, line);
+        return self.emit3(op, 0, 0, 0, line);
     }
 
-    fn emitArg(self: *Compiler, op: Op, arg: u32, line: u32) Error!usize {
-        _ = self.chunk.emitArg(self.arena, op, arg, line) catch return error.OutOfMemory;
+    fn emit1(self: *Compiler, op: Op, a: u32, line: u32) Error!usize {
+        return self.emit3(op, a, 0, 0, line);
+    }
+
+    fn emit2(self: *Compiler, op: Op, a: u32, b: u32, line: u32) Error!usize {
+        return self.emit3(op, a, b, 0, line);
+    }
+
+    fn emit3(self: *Compiler, op: Op, a: u32, b: u32, cc: u32, line: u32) Error!usize {
+        _ = self.chunk.emit(self.arena, .{ .op = op, .a = a, .b = b, .c = cc }, line) catch return error.OutOfMemory;
         return self.chunk.code.items.len - 1;
     }
 
     fn emitInline(self: *Compiler, word: u32, line: u32) Error!usize {
-        _ = self.chunk.emitArg(self.arena, .inline_arg, word, line) catch return error.OutOfMemory;
-        return self.chunk.code.items.len - 1;
+        return self.emit1(.inline_arg, word, line);
     }
 
-    fn patchJmp(self: *Compiler, addr: usize) Error!void {
-        self.chunk.code.items[addr].arg = @intCast(self.chunk.code.items.len);
+    /// Patch a jump's target (.a) to point after the current instruction.
+    fn patchA(self: *Compiler, addr: usize) Error!void {
+        self.chunk.code.items[addr].a = @intCast(self.chunk.code.items.len);
+    }
+
+    /// Same, for two-operand conditional jumps whose target lives in .b
+    /// (.a holds the condition register).
+    fn patchB(self: *Compiler, addr: usize) Error!void {
+        self.chunk.code.items[addr].b = @intCast(self.chunk.code.items.len);
     }
 
     fn here(self: *Compiler) usize {
         return self.chunk.code.items.len;
     }
 
-    fn nameConst(self: *Compiler, name: []const u8, line: u32) Error!u32 {
-        _ = line;
+    fn nameConst(self: *Compiler, name: []const u8) Error!u32 {
         return self.chunk.addConst(self.arena, .{ .str_ = name }) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -194,11 +328,11 @@ pub const Compiler = struct {
         return error.SyntaxError;
     }
 
+    // -- statements --------------------------------------------------------------------
+
     fn compileStmts(self: *Compiler, stmts: []const *ast.Stmt) Error!void {
         for (stmts) |s| try self.compileStmt(s);
     }
-
-    // -- statements --------------------------------------------------------------------
 
     fn compileBody(self: *Compiler, body: *ast.Stmt) Error!void {
         switch (body.kind) {
@@ -211,54 +345,50 @@ pub const Compiler = struct {
         const line = s.line;
         switch (s.kind) {
             .nop => {},
-            .expr => |e| {
-                // Statement-level fusion: `$x += y;` / `$x -= const;` /
-                // `$i++;` discard their results, so a single fused
-                // instruction replaces the whole read-modify-write chain.
-                if (try self.tryEmitFusedAssignStmt(e)) return;
-                try self.compileExpr(e);
-                _ = try self.emit(.pop, line);
-            },
+            .expr => |e| try self.compileExprStmt(e),
             .echo => |exprs| {
-                for (exprs) |e| try self.compileExpr(e);
-                _ = try self.emitArg(.echo, @intCast(exprs.len), line);
+                const base = self.ctx.allocBlock(exprs.len);
+                for (exprs, 0..) |e, i| {
+                    try self.compileInto(base + @as(u32, @intCast(i)), e);
+                }
+                _ = try self.emit2(.echo, base, @intCast(exprs.len), line);
+                self.ctx.freeBlock(base, exprs.len);
             },
             .block => |stmts| try self.compileStmts(stmts),
 
             .if_stmt => |info| {
                 var end_jumps: std.ArrayList(usize) = .empty;
                 for (info.branches) |branch| {
-                    try self.compileExpr(branch.cond);
-                    const jf = try self.emit(.jmp_if_false, branch.cond.line);
+                    const tc = try self.exprToTemp(branch.cond);
+                    const jf = try self.emit2(.jmp_if_false, tc.reg, 0, branch.cond.line);
+                    tc.release(&self.ctx);
                     try self.compileBody(branch.body);
                     try end_jumps.append(self.arena, try self.emit(.jmp, line));
-                    try self.patchJmp(jf);
+                    try self.patchB(jf);
                 }
                 if (info.else_body) |eb| try self.compileBody(eb);
-                for (end_jumps.items) |j| try self.patchJmp(j);
+                for (end_jumps.items) |j| try self.patchA(j);
             },
 
             .while_stmt => |w| {
                 const lc = try self.newLoop();
                 lc.continue_addr = self.here();
 
-                // Hot-path fusion: `local CMP (local|const)` becomes a
-                // single compare-and-branch instruction.
                 var fused_exit: ?usize = null;
+                var exit_jump: ?usize = null;
                 if (try self.tryEmitCondJump(w.cond, line)) |pos| {
                     fused_exit = pos;
                 } else {
-                    try self.compileExpr(w.cond);
+                    const tc = try self.exprToTemp(w.cond);
+                    exit_jump = try self.emit2(.jmp_if_false, tc.reg, 0, line);
+                    tc.release(&self.ctx);
                 }
-
-                var exit_jump: ?usize = null;
-                if (fused_exit == null) exit_jump = try self.emit(.jmp_if_false, line);
                 try self.compileBody(w.body);
-                _ = try self.emitArg(.jmp, @intCast(lc.continue_addr), line);
+                _ = try self.emit1(.jmp, @intCast(lc.continue_addr), line);
                 if (fused_exit) |pos| {
-                    self.chunk.code.items[pos].arg = @intCast(self.here());
+                    self.chunk.code.items[pos].a = @intCast(self.here());
                 } else if (exit_jump) |ej| {
-                    try self.patchJmp(ej);
+                    try self.patchB(ej);
                 }
                 try self.endLoop(lc);
             },
@@ -269,82 +399,70 @@ pub const Compiler = struct {
 
                 try self.compileBody(dw.body);
                 lc.continue_addr = self.here(); // continue -> condition test
-                try self.compileExpr(dw.cond);
-                _ = try self.emitArg(.jmp_if_true, @intCast(body_start), line);
+                const tc = try self.exprToTemp(dw.cond);
+                _ = try self.emit2(.jmp_if_true, tc.reg, @intCast(body_start), line);
+                tc.release(&self.ctx);
                 try self.endLoop(lc);
             },
 
             .for_stmt => |f| {
-                for (f.init) |e| {
-                    try self.compileExpr(e);
-                    _ = try self.emit(.pop, e.line);
-                }
+                for (f.init) |e| try self.compileExprStmt(e);
                 const cond_addr = self.here();
                 const lc = try self.newLoop();
-                lc.continue_addr = 0; // patched to step exprs below
+                lc.continue_addr = 0;
 
-                var exit_jump: ?usize = null;
                 var fused_exit: ?usize = null;
+                var exit_jump: ?usize = null;
                 if (f.cond) |cond| {
                     if (try self.tryEmitCondJump(cond, line)) |pos| {
                         fused_exit = pos;
                     } else {
-                        try self.compileExpr(cond);
-                        exit_jump = try self.emit(.jmp_if_false, line);
+                        const tc = try self.exprToTemp(cond);
+                        exit_jump = try self.emit2(.jmp_if_false, tc.reg, 0, line);
+                        tc.release(&self.ctx);
                     }
                 }
                 try self.compileBody(f.body);
                 const step_addr = self.here();
-                lc.continue_addr = step_addr; // continue -> step expressions
-                for (f.step) |e| {
-                    if (try self.tryEmitFusedAssignStmt(e)) continue;
-                    try self.compileExpr(e);
-                    _ = try self.emit(.pop, e.line);
-                }
-                _ = try self.emitArg(.jmp, @intCast(cond_addr), line);
-                if (exit_jump) |ej| try self.patchJmp(ej);
-                if (fused_exit) |pos| {
-                    self.chunk.code.items[pos].arg = @intCast(self.here());
-                }
+                lc.continue_addr = step_addr;
+                for (f.step) |e| try self.compileExprStmt(e);
+                _ = try self.emit1(.jmp, @intCast(cond_addr), line);
+                if (exit_jump) |ej| try self.patchB(ej);
+                if (fused_exit) |pos| self.chunk.code.items[pos].a = @intCast(self.here());
                 try self.endLoop(lc);
             },
 
             .foreach => |fe| {
-                try self.compileExpr(fe.subject);
-                const temp = self.ctx.newTemp();
-                _ = try self.emitArg(.foreach_init, temp, line);
+                const rs = try self.exprToTemp(fe.subject);
+                const hidden = self.ctx.newHidden();
+                _ = try self.emit3(.foreach_init, hidden, hidden + 1, rs.reg, line);
+                rs.release(&self.ctx);
 
                 const lc = try self.newLoop();
                 lc.is_foreach = true;
                 lc.next_addr = self.here();
-                const packed_arg = opcode.packForeach(temp, fe.key != null);
-                _ = try self.emitArg(.foreach_next, packed_arg, line);
-                // Loop-exit target follows as immediate data.
-                const inline_pos = self.here();
-                _ = try self.emitInline(0, line); // patched after body
-
-                // Bind value then key — foreach_next pushed [key?] value,
-                // so the value sits on top and must be stored first.
-                try self.bindForeachVar(fe.val, line);
-                if (fe.key) |k| try self.bindForeachVar(k, line);
+                const key_out: u32 = if (fe.key) |_| try self.slotOf(fe.key.?, line) else opcode.no_reg;
+                const val_slot = try self.slotOf(fe.val, line);
+                _ = try self.emit2(.foreach_next, key_out, val_slot, line);
+                _ = try self.emitInline(opcode.packForeach(hidden, fe.key != null), line);
+                const exit_pos = try self.emitInline(0, line);
 
                 try self.compileBody(fe.body);
-                _ = try self.emitArg(.jmp, @intCast(lc.next_addr), line);
-                self.chunk.code.items[inline_pos].arg = @intCast(self.here());
+                _ = try self.emit1(.jmp, @intCast(lc.next_addr), line);
+                self.chunk.code.items[exit_pos].a = @intCast(self.here());
                 try self.endLoopForeach(lc);
             },
 
             .func_decl => |fd| {
-                // Separate units via collectFuncs; this instruction performs
-                // runtime registration (conditional-declaration semantics).
-                const k = try self.nameConst(fd.name, line);
-                _ = try self.emitArg(.declare_func, k, line);
+                const k = try self.nameConst(fd.name);
+                _ = try self.emit1(.declare_func, k, line);
             },
 
             .ret => |maybe_e| {
                 if (maybe_e) |e| {
-                    try self.compileExpr(e);
-                    _ = try self.emit(.return_val, line);
+                    const t = try self.exprToTemp(e);
+                    _ = try self.emit1(.return_val, t.reg, line);
+                    t.release(&self.ctx);
                 } else {
                     _ = try self.emit(.return_null, line);
                 }
@@ -355,148 +473,10 @@ pub const Compiler = struct {
         }
     }
 
-    // -- fused superinstructions -------------------------------------------------
-
-    fn cmpSelOf(op: ast.BinOp) ?opcode.CmpSel {
-        return switch (op) {
-            .lt => .lt,
-            .gt => .gt,
-            .lte => .lte,
-            .gte => .gte,
-            .eq => .eq,
-            .neq => .neq,
-            else => null,
-        };
-    }
-
-    const FusedOperand = union(enum) {
-        local: usize,
-        constant: u32, // const pool index
-    };
-
-    /// Classify an operand for fusion: local slot or compile-time constant.
-    fn fusedOperand(self: *Compiler, e: *ast.Expr) Error!?FusedOperand {
-        switch (e.kind) {
-            .var_ref => |name| {
-                const slot = try self.ctx.resolveLocal(self.arena, name);
-                if (slot > 0x1FFF) return null;
-                return .{ .local = slot };
-            },
-            else => {
-                const cv = constEval(e) orelse return null;
-                const idx = self.chunk.addConst(self.arena, cv) catch return error.OutOfMemory;
-                return .{ .constant = idx };
-            },
-        }
-    }
-
-    /// Statement `$x <op>= y;` / `$x++;` with discarded result -> one fused
-    /// instruction. Returns false when the pattern does not apply.
-    fn tryEmitFusedAssignStmt(self: *Compiler, e: *ast.Expr) Error!bool {
-        const line = e.line;
-        if (e.kind == .inc_dec) {
-            const d = e.kind.inc_dec;
-            if (!d.postfix) return false;
-            if (d.target.kind != .var_ref) return false;
-            const slot = try self.ctx.resolveLocal(self.arena, d.target.kind.var_ref);
-            const op: Op = if (d.up) .post_inc_local_discard else .post_dec_local_discard;
-            _ = try self.emitArg(op, @intCast(slot), line);
-            return true;
-        }
-        if (e.kind != .assign) return false;
-        const a = e.kind.assign;
-        if (a.target.kind != .var_ref) return false;
-        const arith_kind: ArithFusion = switch (a.op) {
-            .add => .add,
-            .sub => .sub,
-            else => return false,
-        };
-        const dst = try self.ctx.resolveLocal(self.arena, a.target.kind.var_ref);
-        if (dst > 0xFFFF) return false;
-        const src = try self.fusedOperand(a.value) orelse return false;
-        switch (src) {
-            .local => |src_slot| {
-                if (src_slot > 0xFFFF) return false;
-                const op: Op = switch (arith_kind) {
-                    .add => .add_set_local_local,
-                    .sub => .sub_set_local_local,
-                };
-                _ = try self.emitArg(op, @intCast(dst | (src_slot << 16)), line);
-            },
-            .constant => |ci| {
-                if (ci > 0xFFFF) return false;
-                const op: Op = switch (arith_kind) {
-                    .add => .add_set_local_const,
-                    .sub => .sub_set_local_const,
-                };
-                _ = try self.emitArg(op, @intCast(dst | (ci << 16)), line);
-            },
-        }
-        return true;
-    }
-
-    const ArithFusion = enum { add, sub };
-
-    /// Fuse `local CMP (local|const)` loop conditions into a single
-    /// compare-and-branch instruction. Returns the inline-word position to
-    /// patch with the loop-exit target, or null when the pattern does not
-    /// apply (caller falls back to the generic path).
-    fn tryEmitCondJump(self: *Compiler, cond: *ast.Expr, line: u32) Error!?usize {
-        if (cond.kind != .binary) return null;
-        const b = cond.kind.binary;
-        var sel = cmpSelOf(b.op) orelse return null;
-
-        var lhs = try self.fusedOperand(b.lhs);
-        var rhs = try self.fusedOperand(b.rhs);
-        // Mirror when the constant/local arrangement needs it:
-        // (const CMP local) == (local flip(CMP) const)
-        if (lhs != null and lhs.? == .local and rhs != null and rhs.? == .local) {
-            // both locals: direct ll form below
-        } else if (rhs != null and rhs.? == .local and (lhs == null or lhs.? == .constant)) {
-            sel = switch (sel) {
-                .lt => .gt,
-                .gt => .lt,
-                .lte => .gte,
-                .gte => .lte,
-                .eq => .eq,
-                .neq => .neq,
-            };
-            const tmp = lhs;
-            lhs = rhs;
-            rhs = tmp;
-        }
-
-        switch (lhs orelse return null) {
-            .local => |slot| switch (rhs orelse return null) {
-                .local => |slot2| {
-                    const arg: u32 = @as(u32, @intFromEnum(sel)) << 26 |
-                        (@as(u32, @intCast(slot2)) << 13) |
-                        @as(u32, @intCast(slot));
-                    _ = try self.emitArg(.cmp_jmp_local_local, arg, line);
-                    const inline_pos = try self.emitInline(0, line); // target patched by caller
-                    return inline_pos;
-                },
-                .constant => |ci| {
-                    if (ci > 0xFFFFFF) return null;
-                    const arg: u32 = (@as(u32, @intFromEnum(sel)) << 24) | @as(u32, @intCast(slot));
-                    _ = try self.emitArg(.cmp_jmp_local_const, arg, line);
-                    _ = try self.emitInline(ci, line);
-                    const target_pos = try self.emitInline(0, line);
-                    return target_pos;
-                },
-            },
-            .constant => return null, // const CMP const — no point fusing
-        }
-    }
-
-    fn bindForeachVar(self: *Compiler, name: []const u8, line: u32) Error!void {
-        if (self.ctx.is_global_scope) {
-            const k = try self.nameConst(name, line);
-            _ = try self.emitArg(.set_global, k, line);
-        } else {
-            const slot = try self.ctx.resolveLocal(self.arena, name);
-            _ = try self.emitArg(.set_local, @intCast(slot), line);
-        }
+    fn slotOf(self: *Compiler, name: []const u8, line: u32) Error!u32 {
+        _ = line;
+        const slot = try self.ctx.resolveLocal(self.arena, name);
+        return @intCast(slot);
     }
 
     fn newLoop(self: *Compiler) Error!*LoopCtx {
@@ -513,9 +493,7 @@ pub const Compiler = struct {
         }
         const lc = self.loops.items[self.loops.items.len - level];
         if (is_continue and lc.is_foreach and level == 1) {
-            // `continue` in the innermost foreach jumps straight to its
-            // iterator-advance instruction.
-            _ = try self.emitArg(.jmp, @intCast(lc.next_addr), line);
+            _ = try self.emit1(.jmp, @intCast(lc.next_addr), line);
             return;
         }
         const j = try self.emit(.jmp, line);
@@ -529,19 +507,17 @@ pub const Compiler = struct {
     fn endLoop(self: *Compiler, lc: *LoopCtx) Error!void {
         _ = self.loops.pop();
         for (lc.continue_jumps.items) |j| {
-            self.chunk.code.items[j].arg = @intCast(lc.continue_addr);
+            self.chunk.code.items[j].a = @intCast(lc.continue_addr);
         }
-        for (lc.break_jumps.items) |j| try self.patchJmp(j);
+        for (lc.break_jumps.items) |j| try self.patchA(j);
     }
 
     fn endLoopForeach(self: *Compiler, lc: *LoopCtx) Error!void {
-        // continue jumps were redirected at emission time (innermost case);
-        // outer-level continues/breaks patch like normal loops.
         _ = self.loops.pop();
         for (lc.continue_jumps.items) |j| {
-            self.chunk.code.items[j].arg = @intCast(lc.next_addr);
+            self.chunk.code.items[j].a = @intCast(lc.next_addr);
         }
-        for (lc.break_jumps.items) |j| try self.patchJmp(j);
+        for (lc.break_jumps.items) |j| try self.patchA(j);
     }
 
     // -- expressions -----------------------------------------------------------------------
@@ -569,374 +545,534 @@ pub const Compiler = struct {
             .bit_xor => .bit_xor,
             .shl => .shl,
             .shr => .shr,
-            else => unreachable, // short-circuit forms handled in compileBinary
+            else => unreachable,
         };
     }
 
-    fn compileBinary(self: *Compiler, b: anytype, line: u32) Error!void {
+    /// Evaluate an expression into a freshly allocated temporary.
+    fn exprToTemp(self: *Compiler, e: *ast.Expr) Error!Reg {
+        const r = self.ctx.alloc();
+        try self.compileInto(r, e);
+        return .{ .reg = r, .owned = true };
+    }
+
+    /// Evaluate an expression; plain variable reads reuse their slot without
+    /// a copy (callers must not free unowned registers).
+    fn exprToReg(self: *Compiler, e: *ast.Expr) Error!Reg {
+        if (e.kind == .var_ref) {
+            const slot = try self.ctx.resolveLocal(self.arena, e.kind.var_ref);
+            return .{ .reg = @intCast(slot), .owned = false };
+        }
+        return self.exprToTemp(e);
+    }
+
+    fn compileBinary(self: *Compiler, b: anytype, dst: u32, line: u32) Error!void {
         switch (b.op) {
             .logic_and => {
-                try self.compileExpr(b.lhs);
-                const j = try self.emit(.jmp_if_false_keep, line);
-                _ = try self.emit(.pop, line);
-                try self.compileExpr(b.rhs);
-                _ = try self.emit(.to_bool, line);
-                try self.patchJmp(j);
+                const t1 = try self.exprToTemp(b.lhs);
+                _ = try self.emit2(.to_bool, t1.reg, t1.reg, line);
+                _ = try self.emit1(.ld_false, dst, line); // pessimistic
+                const jf = try self.emit2(.jmp_if_false, t1.reg, 0, line);
+                const t2 = try self.exprToTemp(b.rhs);
+                _ = try self.emit2(.to_bool, t2.reg, t2.reg, line);
+                if (dst != t2.reg) _ = try self.emit2(.mov, dst, t2.reg, line);
+                t2.release(&self.ctx);
+                try self.patchB(jf);
+                t1.release(&self.ctx);
             },
             .logic_or => {
-                try self.compileExpr(b.lhs);
-                const j = try self.emit(.jmp_if_true_keep, line);
-                _ = try self.emit(.pop, line);
-                try self.compileExpr(b.rhs);
-                _ = try self.emit(.to_bool, line);
-                try self.patchJmp(j);
+                const t1 = try self.exprToTemp(b.lhs);
+                _ = try self.emit2(.to_bool, t1.reg, t1.reg, line);
+                _ = try self.emit1(.ld_true, dst, line); // pessimistic
+                const jt = try self.emit2(.jmp_if_true, t1.reg, 0, line);
+                const t2 = try self.exprToTemp(b.rhs);
+                _ = try self.emit2(.to_bool, t2.reg, t2.reg, line);
+                if (dst != t2.reg) _ = try self.emit2(.mov, dst, t2.reg, line);
+                t2.release(&self.ctx);
+                try self.patchB(jt);
+                t1.release(&self.ctx);
             },
             .coalesce => {
-                try self.compileExpr(b.lhs);
-                try self.compileExpr(b.rhs);
-                _ = try self.emit(.coalesce, line);
+                const t1 = try self.exprToTemp(b.lhs);
+                const t2 = try self.exprToTemp(b.rhs);
+                _ = try self.emit3(.coalesce, dst, t1.reg, t2.reg, line);
+                t2.release(&self.ctx);
+                t1.release(&self.ctx);
             },
             .logic_xor => {
-                try self.compileExpr(b.lhs);
-                try self.compileExpr(b.rhs);
-                _ = try self.emit(.logic_xor, line);
+                const t1 = try self.exprToTemp(b.lhs);
+                const t2 = try self.exprToTemp(b.rhs);
+                // xor == neq on truthiness
+                _ = try self.emit2(.to_bool, t1.reg, t1.reg, line);
+                _ = try self.emit2(.to_bool, t2.reg, t2.reg, line);
+                _ = try self.emit3(.neq, dst, t1.reg, t2.reg, line);
+                t2.release(&self.ctx);
+                t1.release(&self.ctx);
             },
             else => {
-                try self.compileExpr(b.lhs);
-                try self.compileExpr(b.rhs);
-                _ = try self.emit(binOpOf(b.op), line);
+                const r1 = try self.exprToReg(b.lhs);
+                const r2 = try self.exprToReg(b.rhs);
+                _ = try self.emit3(binOpOf(b.op), dst, r1.reg, r2.reg, line);
+                r2.release(&self.ctx);
+                r1.release(&self.ctx);
             },
         }
     }
 
-    fn compileExpr(self: *Compiler, e: *ast.Expr) Error!void {
+    fn compileInto(self: *Compiler, dst: u32, e: *ast.Expr) Error!void {
         const line = e.line;
         switch (e.kind) {
             .int_lit => |i| {
                 const k = try self.chunk.addConst(self.arena, .{ .int_ = i });
-                _ = try self.emitArg(.const_k, k, line);
+                _ = try self.emit2(.ld_const, dst, k, line);
             },
             .float_lit => |f| {
                 const k = try self.chunk.addConst(self.arena, .{ .float_ = f });
-                _ = try self.emitArg(.const_k, k, line);
+                _ = try self.emit2(.ld_const, dst, k, line);
             },
             .str_lit => |st| {
                 const k = try self.chunk.addConst(self.arena, .{ .str_ = st });
-                _ = try self.emitArg(.const_k, k, line);
+                _ = try self.emit2(.ld_const, dst, k, line);
             },
-            .bool_lit => |b| _ = try self.emit(if (b) .true_ else .false_, line),
-            .null_lit => _ = try self.emit(.null_, line),
+            .bool_lit => |b| _ = try self.emit1(if (b) .ld_true else .ld_false, dst, line),
+            .null_lit => _ = try self.emit1(.ld_null, dst, line),
 
-            .var_ref => |name| try self.pushVar(name, line),
+            .var_ref => |name| {
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
+            },
 
             .interp_str => |parts| {
-                var n: usize = 0;
-                for (parts) |part| {
+                if (parts.len == 0) {
+                    const k = try self.chunk.addConst(self.arena, .{ .str_ = "" });
+                    _ = try self.emit2(.ld_const, dst, k, line);
+                    return;
+                }
+                const base = self.ctx.allocBlock(parts.len);
+                for (parts, 0..) |part, i| {
+                    const r = base + @as(u32, @intCast(i));
                     switch (part) {
                         .literal => |lit| {
                             const k = try self.chunk.addConst(self.arena, .{ .str_ = lit });
-                            _ = try self.emitArg(.const_k, k, line);
+                            _ = try self.emit2(.ld_const, r, k, line);
                         },
-                        .var_ref => |name| try self.pushVar(name, line),
+                        .var_ref => |name| {
+                            const slot = try self.ctx.resolveLocal(self.arena, name);
+                            _ = try self.emit2(.mov, r, @intCast(slot), line);
+                        },
                         .var_index => |vi| {
-                            try self.pushVar(vi.name, line);
+                            const slot = try self.ctx.resolveLocal(self.arena, vi.name);
+                            _ = try self.emit2(.mov, r, @intCast(slot), line);
                             for (vi.keys) |key| {
+                                const tk = self.ctx.alloc();
                                 switch (key) {
                                     .str => |ks| {
                                         const k = try self.chunk.addConst(self.arena, .{ .str_ = ks });
-                                        _ = try self.emitArg(.const_k, k, line);
+                                        _ = try self.emit2(.ld_const, tk, k, line);
                                     },
                                     .int => |iv| {
                                         const k = try self.chunk.addConst(self.arena, .{ .int_ = iv });
-                                        _ = try self.emitArg(.const_k, k, line);
+                                        _ = try self.emit2(.ld_const, tk, k, line);
                                     },
                                 }
-                                _ = try self.emit(.get_index, line);
+                                _ = try self.emit3(.get_index, r, r, tk, line);
+                                self.ctx.freeReg(tk);
                             }
                         },
                     }
-                    n += 1;
                 }
-                if (n == 0) {
-                    const k = try self.chunk.addConst(self.arena, .{ .str_ = "" });
-                    _ = try self.emitArg(.const_k, k, line);
-                } else if (n > 1) {
-                    _ = try self.emitArg(.strconcat, @intCast(n), line);
+                if (parts.len > 1) {
+                    _ = try self.emit3(.strconcat, dst, base, @intCast(parts.len), line);
+                } else {
+                    _ = try self.emit2(.mov, dst, base, line);
                 }
+                self.ctx.freeBlock(base, parts.len);
             },
 
             .array_lit => |items| {
-                // Build in source order so auto-key sequencing matches PHP:
-                // [9, 'k' => 2] gives 0=>9 then 'k'=>2.
-                _ = try self.emitArg(.new_array, 0, line);
+                _ = try self.emit1(.new_array, dst, line);
                 for (items) |item| {
-                    _ = try self.emit(.dup, line); // keep the array under us
                     if (item.key) |ke| {
-                        try self.compileExpr(ke);
-                        try self.compileExpr(item.val);
-                        _ = try self.emit(.set_index, line);
+                        const tk = try self.exprToTemp(ke);
+                        const tv = try self.exprToTemp(item.val);
+                        _ = try self.emit3(.set_index, dst, tk.reg, tv.reg, line);
+                        tv.release(&self.ctx);
+                        tk.release(&self.ctx);
                     } else {
-                        try self.compileExpr(item.val);
-                        _ = try self.emit(.append_index, line);
+                        const tv = try self.exprToTemp(item.val);
+                        _ = try self.emit2(.append_arr, dst, tv.reg, line);
+                        tv.release(&self.ctx);
                     }
-                    // Both ops push the stored value for assignment
-                    // expressions; inside a literal only the array remains.
-                    _ = try self.emit(.pop, line);
                 }
             },
 
             .unary => |u| {
-                try self.compileExpr(u.operand);
-                _ = try self.emit(switch (u.op) {
+                const t = try self.exprToTemp(u.operand);
+                const op: Op = switch (u.op) {
                     .neg => .neg,
                     .pos => .pos,
                     .not => .not,
                     .bit_not => .bit_not,
-                }, line);
+                };
+                _ = try self.emit2(op, dst, t.reg, line);
+                t.release(&self.ctx);
             },
 
-            .binary => |b| try self.compileBinary(b, line),
+            .binary => |b| try self.compileBinary(b, dst, line),
 
             .ternary => |tn| {
-                try self.compileExpr(tn.cond);
+                const tc = try self.exprToTemp(tn.cond);
                 if (tn.then) |then_e| {
-                    const jf = try self.emit(.jmp_if_false, line);
-                    try self.compileExpr(then_e);
+                    const jf = try self.emit2(.jmp_if_false, tc.reg, 0, line);
+                    tc.release(&self.ctx);
+                    try self.compileInto(dst, then_e);
                     const jend = try self.emit(.jmp, line);
-                    try self.patchJmp(jf);
-                    try self.compileExpr(tn.els);
-                    try self.patchJmp(jend);
+                    try self.patchB(jf);
+                    try self.compileInto(dst, tn.els);
+                    try self.patchA(jend);
                 } else {
                     // Shorthand `$a ?: b`: cond is also the then-value.
-                    const jt = try self.emit(.jmp_if_true_raw, line); // truthy: keep cond
-                    try self.compileExpr(tn.els);
-                    try self.patchJmp(jt);
+                    _ = try self.emit2(.mov, dst, tc.reg, line);
+                    _ = try self.emit2(.jmp_if_true, dst, 0, line);
+                    tc.release(&self.ctx);
+                    try self.compileInto(dst, tn.els);
                 }
             },
 
-            .assign => |a| try self.compileAssign(a.target, a.op, a.value, line),
-            .inc_dec => |d| try self.compileIncDec(d.target, d.up, d.postfix, line),
+            .assign => try self.compileAssign(dst, e, line),
+
+            .inc_dec => |d| try self.compileIncDec(dst, d.target, d.up, d.postfix, line),
 
             .call => |c| {
-                for (c.args) |arg| try self.compileExpr(arg);
-                const k = try self.nameConst(c.name, line);
-                _ = try self.emitArg(.call, opcode.packCall(k, @intCast(c.args.len)), line);
+                // Reserve at least one register so the result slot always
+                // exists even for zero-argument calls.
+                const n = @max(c.args.len, 1);
+                const base = self.ctx.allocBlock(n);
+                for (c.args, 0..) |ae, i| {
+                    try self.compileInto(base + @as(u32, @intCast(i)), ae);
+                }
+                const k = try self.nameConst(c.name);
+                _ = try self.emit3(.call, @intCast(c.args.len), base, k, line);
+                // Result overwrites regs[base].
+                if (dst != base) _ = try self.emit2(.mov, dst, base, line);
+                self.ctx.freeBlock(base, n);
             },
 
             .index => |ix| {
-                try self.compileExpr(ix.base);
-                if (ix.index) |ie| {
-                    try self.compileExpr(ie);
-                    _ = try self.emit(.get_index, line);
-                } else {
+                const tb = try self.exprToReg(ix.base);
+                const tk = try self.exprToTemp(ix.index orelse {
                     return self.fail(line, "cannot read from array without an index", .{});
-                }
+                });
+                _ = try self.emit3(.get_index, dst, tb.reg, tk.reg, line);
+                tk.release(&self.ctx);
+                tb.release(&self.ctx);
             },
 
             .isset => |exprs| {
-                // isset(a, b, ...) === isset(a) && isset(b) && ...
-                try self.compileIssetOne(exprs[0], line);
+                try self.compileIssetOne(dst, exprs[0], line);
                 for (exprs[1..]) |x| {
-                    const j = try self.emit(.jmp_if_false_keep, line);
-                    _ = try self.emit(.pop, line);
-                    try self.compileIssetOne(x, line);
-                    try self.patchJmp(j);
+                    const jf = try self.emit2(.jmp_if_false, dst, 0, line);
+                    try self.compileIssetOne(dst, x, line);
+                    try self.patchB(jf);
                 }
             },
 
             .empty => |inner| {
-                try self.compileExpr(inner);
-                _ = try self.emit(.to_bool, line);
-                _ = try self.emit(.not, line);
+                const t = try self.exprToTemp(inner);
+                _ = try self.emit2(.to_bool, t.reg, t.reg, line);
+                _ = try self.emit2(.not, dst, t.reg, line);
+                t.release(&self.ctx);
             },
         }
     }
 
-    fn pushVar(self: *Compiler, name: []const u8, line: u32) Error!void {
-        if (self.ctx.is_global_scope) {
-            const k = try self.nameConst(name, line);
-            _ = try self.emitArg(.get_global, k, line);
-        } else {
-            const slot = try self.ctx.resolveLocal(self.arena, name);
-            _ = try self.emitArg(.get_local, @intCast(slot), line);
-        }
-    }
-
-    fn storeVar(self: *Compiler, name: []const u8, line: u32) Error!void {
-        if (self.ctx.is_global_scope) {
-            const k = try self.nameConst(name, line);
-            _ = try self.emitArg(.set_global, k, line);
-        } else {
-            const slot = try self.ctx.resolveLocal(self.arena, name);
-            _ = try self.emitArg(.set_local, @intCast(slot), line);
-        }
-    }
-
-    fn compileIssetOne(self: *Compiler, x: *ast.Expr, line: u32) Error!void {
+    fn compileIssetOne(self: *Compiler, dst: u32, x: *ast.Expr, line: u32) Error!void {
         switch (x.kind) {
             .var_ref => |name| {
-                if (self.ctx.is_global_scope) {
-                    const k = try self.nameConst(name, line);
-                    _ = try self.emitArg(.isset_global, k, line);
-                } else {
-                    const slot = try self.ctx.resolveLocal(self.arena, name);
-                    _ = try self.emitArg(.isset_local, @intCast(slot), line);
-                }
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                _ = try self.emit2(.isset_local, dst, @intCast(slot), line);
             },
             .index => |ix| {
-                try self.compileReadPath(ix.base, line);
-                if (ix.index) |ie| {
-                    try self.compileExpr(ie);
-                } else {
-                    _ = try self.emit(.null_, line);
-                }
-                _ = try self.emit(.isset_index, line);
+                const tb = try self.exprToReg(ix.base);
+                const tk = try self.exprToTemp(ix.index orelse {
+                    return self.fail(line, "invalid isset() operand", .{});
+                });
+                _ = try self.emit3(.isset_index, dst, tb.reg, tk.reg, line);
+                tk.release(&self.ctx);
+                tb.release(&self.ctx);
             },
             else => {
-                try self.compileExpr(x);
-                _ = try self.emit(.is_not_null, line);
+                const t = try self.exprToTemp(x);
+                _ = try self.emit2(.is_not_null, dst, t.reg, line);
+                t.release(&self.ctx);
             },
         }
     }
 
-    fn compileAssign(self: *Compiler, target: *ast.Expr, op: ast.AssignOp, value: *ast.Expr, line: u32) Error!void {
-        switch (target.kind) {
+    /// Leave a vivified array pointer in `dst` — the array that receives the
+    /// caller's key write (`$undefined['a']['b'] = 1` auto-vivifies).
+    fn compileContainerPath(self: *Compiler, dst: u32, base: *ast.Expr, line: u32) Error!void {
+        switch (base.kind) {
             .var_ref => |name| {
-                if (op == .coalesce) {
-                    // $x ??= v  ==>  x = (x ?? v)
-                    try self.pushVar(name, line);
-                    try self.compileExpr(value);
-                    _ = try self.emit(.coalesce, line);
-                    _ = try self.emit(.dup, line);
-                    try self.storeVar(name, line);
-                    return;
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                _ = try self.emit2(.vivify_local, dst, @intCast(slot), line);
+            },
+            .index => |ix| {
+                const parent = self.ctx.alloc();
+                try self.compileContainerPath(parent, ix.base, line);
+                const tk = try self.exprToTemp(ix.index orelse {
+                    return self.fail(line, "invalid assignment target", .{});
+                });
+                _ = try self.emit3(.subcontainer, dst, parent, tk.reg, line);
+                self.ctx.freeReg(tk.reg);
+                self.ctx.freeReg(parent);
+            },
+            else => return self.fail(line, "invalid assignment target", .{}),
+        }
+    }
+
+    fn compileAssign(self: *Compiler, dst: u32, e: *ast.Expr, line: u32) Error!void {
+        const a = e.kind.assign;
+        switch (a.target.kind) {
+            .var_ref => |name| {
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                switch (a.op) {
+                    .assign => try self.compileInto(@intCast(slot), a.value),
+                    .coalesce => {
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(.coalesce, @intCast(slot), @intCast(slot), tv.reg, line);
+                        tv.release(&self.ctx);
+                    },
+                    else => {
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(binOpOf(compoundBinOp(a.op)), @intCast(slot), @intCast(slot), tv.reg, line);
+                        tv.release(&self.ctx);
+                    },
                 }
-                if (op != .assign) {
-                    try self.pushVar(name, line);
-                    try self.compileExpr(value);
-                    _ = try self.emit(compoundOp(op), line);
-                } else {
-                    try self.compileExpr(value);
-                }
-                // Assignment is an expression: duplicate so the value
-                // remains after the store consumes one copy.
-                _ = try self.emit(.dup, line);
-                try self.storeVar(name, line);
+                if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
             },
 
             .index => |ix| {
-                // Resolve parent container + key once: [parent key]
-                try self.compileContainerPath(ix.base, line);
-                if (ix.index) |ke| {
-                    try self.compileExpr(ke);
-                } else {
-                    if (op != .assign) {
+                const parent = self.ctx.alloc();
+                try self.compileContainerPath(parent, ix.base, line);
+
+                if (ix.index == null) {
+                    // $a[] = v — append
+                    if (a.op != .assign) {
                         return self.fail(line, "[] operator supports only append assignment", .{});
                     }
-                    try self.compileExpr(value);
-                    _ = try self.emit(.append_index, line); // pops container+value, pushes value
+                    const tv = try self.exprToTemp(a.value);
+                    _ = try self.emit2(.append_arr, parent, tv.reg, line);
+                    if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                    tv.release(&self.ctx);
+                    self.ctx.freeReg(parent);
                     return;
                 }
 
-                if (op == .assign) {
-                    try self.compileExpr(value);
-                } else {
-                    // [P k] -> [P k P k] -> old -> combine with rhs
-                    _ = try self.emit(.dup2, line);
-                    _ = try self.emit(.get_index, line);
-                    try self.compileExpr(value);
-                    _ = try self.emit(compoundOp(op), line);
+                const tk = try self.exprToTemp(ix.index.?);
+
+                switch (a.op) {
+                    .assign => {
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(.set_index, parent, tk.reg, tv.reg, line);
+                        if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                        tv.release(&self.ctx);
+                    },
+                    .coalesce => {
+                        const told = self.ctx.alloc();
+                        _ = try self.emit3(.get_index, told, parent, tk.reg, line);
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(.coalesce, told, told, tv.reg, line);
+                        _ = try self.emit3(.set_index, parent, tk.reg, told, line);
+                        if (dst != told) _ = try self.emit2(.mov, dst, told, line);
+                        self.ctx.freeReg(tv.reg);
+                        self.ctx.freeReg(told);
+                    },
+                    else => {
+                        const told = self.ctx.alloc();
+                        _ = try self.emit3(.get_index, told, parent, tk.reg, line);
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(binOpOf(compoundBinOp(a.op)), tv.reg, told, tv.reg, line);
+                        _ = try self.emit3(.set_index, parent, tk.reg, tv.reg, line);
+                        if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                        self.ctx.freeReg(tv.reg);
+                        self.ctx.freeReg(told);
+                    },
                 }
-                _ = try self.emit(.set_index, line); // pops [P k v], pushes v
+                self.ctx.freeReg(tk.reg);
+                self.ctx.freeReg(parent);
             },
 
             else => return self.fail(line, "invalid assignment target", .{}),
         }
     }
 
-    /// Leave ONE vivified array pointer on the stack: the array into which
-    /// the caller's key will be written. Auto-vivifies every level
-    /// (`$undefined['a']['b'] = 1` creates the intermediate arrays).
-    fn compileContainerPath(self: *Compiler, base: *ast.Expr, line: u32) Error!void {
-        switch (base.kind) {
-            .var_ref => |name| {
-                if (self.ctx.is_global_scope) {
-                    const k = try self.nameConst(name, line);
-                    _ = try self.emitArg(.get_container_global, k, line);
-                } else {
-                    const slot = try self.ctx.resolveLocal(self.arena, name);
-                    _ = try self.emitArg(.get_container_local, @intCast(slot), line);
-                }
-            },
-            .index => |ix| {
-                try self.compileContainerPath(ix.base, line);
-                if (ix.index) |k| {
-                    try self.compileExpr(k);
-                } else {
-                    return self.fail(line, "invalid assignment target", .{});
-                }
-                _ = try self.emit(.subcontainer, line); // [parent key] -> [vivified sub-array]
-            },
-            else => return self.fail(line, "invalid assignment target", .{}),
-        }
-    }
-
-    /// Leave [base key] on the stack WITHOUT vivifying anything (isset path):
-    /// a missing variable or index reads as null and isset_index reports false.
-    fn compileReadPath(self: *Compiler, base: *ast.Expr, line: u32) Error!void {
-        switch (base.kind) {
-            .var_ref => |name| try self.pushVar(name, line),
-            .index => |ix| {
-                try self.compileReadPath(ix.base, line);
-                if (ix.index) |k| {
-                    try self.compileExpr(k);
-                } else {
-                    _ = try self.emit(.null_, line);
-                }
-                _ = try self.emit(.get_index, line); // null-safe read
-            },
-            else => return self.fail(line, "invalid isset() operand", .{}),
-        }
-    }
-
-    fn compileIncDec(self: *Compiler, target: *ast.Expr, up: bool, postfix: bool, line: u32) Error!void {
+    fn compileIncDec(self: *Compiler, dst: u32, target: *ast.Expr, up: bool, postfix: bool, line: u32) Error!void {
         switch (target.kind) {
-        .var_ref => |name| {
-            if (self.ctx.is_global_scope) {
-                const k = try self.nameConst(name, line);
-                const op: Op = switch (up) {
-                    true => if (postfix) Op.post_inc_global else Op.pre_inc_global,
-                    false => if (postfix) Op.post_dec_global else Op.pre_dec_global,
-                };
-                _ = try self.emitArg(op, k, line);
-            } else {
+            .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
-                const op: Op = switch (up) {
-                    true => if (postfix) Op.post_inc_local else Op.pre_inc_local,
-                    false => if (postfix) Op.post_dec_local else Op.pre_dec_local,
-                };
-                _ = try self.emitArg(op, @intCast(slot), line);
-            }
-        },
-            .index => |ix| {
-                try self.compileContainerPath(ix.base, line);
-                if (ix.index) |ke| {
-                    try self.compileExpr(ke);
+                if (postfix) {
+                    // dst = old; slot = old +/- 1
+                    const op: Op = if (up) .post_inc_l else .post_dec_l;
+                    _ = try self.emit2(op, dst, @intCast(slot), line);
                 } else {
-                    return self.fail(line, "cannot increment without an index", .{});
+                    // slot +/-= 1; dst = new
+                    const op: Op = if (up) .inc_l else .dec_l;
+                    _ = try self.emit1(op, @intCast(slot), line);
+                    if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
                 }
-                const op: Op = switch (up) {
-                    true => if (postfix) Op.post_inc_index else Op.pre_inc_index,
-                    false => if (postfix) Op.post_dec_index else Op.pre_dec_index,
-                };
-                _ = try self.emit(op, line);
+            },
+            .index => |ix| {
+                const parent = self.ctx.alloc();
+                try self.compileContainerPath(parent, ix.base, line);
+                const tk = try self.exprToTemp(ix.index orelse {
+                    return self.fail(line, "cannot increment without an index", .{});
+                });
+                if (postfix) {
+                    const op: Op = if (up) .post_inc_idx else .post_dec_idx;
+                    _ = try self.emit3(op, dst, parent, tk.reg, line);
+                } else {
+                    const op: Op = if (up) .inc_idx else .dec_idx;
+                    _ = try self.emit3(op, parent, tk.reg, 0, line);
+                    _ = try self.emit3(.get_index, dst, parent, tk.reg, line); // new value
+                }
+                self.ctx.freeReg(tk.reg);
+                self.ctx.freeReg(parent);
             },
             else => return self.fail(line, "invalid increment/decrement target", .{}),
         }
     }
+
+    fn compileExprStmt(self: *Compiler, e: *ast.Expr) Error!void {
+        const line = e.line;
+        // Statement-level fusion: assignments/inc-dec whose results are
+        // discarded write straight into their target register.
+        switch (e.kind) {
+            .assign => |a| {
+                if (a.target.kind == .var_ref) {
+                    // Compile with dst == target slot; no extra move.
+                    const slot = try self.ctx.resolveLocal(self.arena, a.target.kind.var_ref);
+                    try self.compileAssign(@intCast(slot), e, line);
+                    return;
+                }
+                if (a.target.kind == .index) {
+                    const discard = self.ctx.alloc();
+                    try self.compileAssign(discard, e, line);
+                    self.ctx.freeReg(discard);
+                    return;
+                }
+            },
+            .inc_dec => |d| {
+                // Pre-increment as a statement is a pure in-place mutation;
+                // its (new-value) result is discarded.
+                switch (d.target.kind) {
+                    .var_ref => |name| {
+                        const slot = try self.ctx.resolveLocal(self.arena, name);
+                        try self.compileIncDec(@intCast(slot), d.target, d.up, false, line);
+                        return;
+                    },
+                    .index => {
+                        const discard = self.ctx.alloc();
+                        try self.compileIncDec(discard, d.target, d.up, false, line);
+                        self.ctx.freeReg(discard);
+                        return;
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+        const t = try self.exprToTemp(e);
+        t.release(&self.ctx);
+    }
+
+    // -- fused compare-and-branch -------------------------------------------------
+
+    fn release(self: *Compiler, r: Reg) void {
+        if (r.owned) self.ctx.freeReg(r.reg);
+    }
+
+    fn cmpSelOf(op: ast.BinOp) ?opcode.CmpSel {
+        return switch (op) {
+            .lt => .lt,
+            .gt => .gt,
+            .lte => .lte,
+            .gte => .gte,
+            .eq => .eq,
+            .neq => .neq,
+            else => null,
+        };
+    }
+
+    const FusedOperand = union(enum) {
+        local: u32,
+        constant: u32, // const pool index
+    };
+
+    fn fusedOperand(self: *Compiler, e: *ast.Expr) Error!?FusedOperand {
+        switch (e.kind) {
+            .var_ref => |name| {
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                if (slot > 0x1FFF) return null;
+                return .{ .local = @intCast(slot) };
+            },
+            else => {
+                const cv = constEval(e) orelse return null;
+                const idx = self.chunk.addConst(self.arena, cv) catch return error.OutOfMemory;
+                if (idx > 0xFFFFFF) return null;
+                return .{ .constant = idx };
+            },
+        }
+    }
+
+    /// Fuse `local CMP (local|const)` loop conditions into a single
+    /// compare-and-branch instruction. Returns the position of the inline
+    /// word holding the loop-exit target, or null when not applicable.
+    fn tryEmitCondJump(self: *Compiler, cond: *ast.Expr, line: u32) Error!?usize {
+        if (cond.kind != .binary) return null;
+        const b = cond.kind.binary;
+        var sel = cmpSelOf(b.op) orelse return null;
+
+        var lhs = try self.fusedOperand(b.lhs);
+        var rhs = try self.fusedOperand(b.rhs);
+
+        if (lhs == null or rhs == null) return null;
+
+        // Normalize to local-first form.
+        if (lhs.? == .constant) {
+            sel = switch (sel) {
+                .lt => .gt,
+                .gt => .lt,
+                .lte => .gte,
+                .gte => .lte,
+                .eq => .eq,
+                .neq => .neq,
+            };
+            const tmp = lhs;
+            lhs = rhs;
+            rhs = tmp;
+        }
+        if (lhs.? != .local) return null; // const CMP const: pointless
+
+        const slot: u32 = lhs.?.local;
+        switch (rhs.?) {
+            .local => |slot2| {
+                const arg: u32 = @as(u32, @intFromEnum(sel)) << 26 |
+                    (slot2 << 13) | slot;
+                _ = try self.emit1(.if_cmp_jmp_ll, arg, line);
+                return try self.emitInline(0, line); // target patched by caller
+            },
+            .constant => |ci| {
+                const arg: u32 = (@as(u32, @intFromEnum(sel)) << 24) | slot;
+                _ = try self.emit1(.if_cmp_jmp_lc, arg, line);
+                _ = try self.emitInline(ci, line);
+                return try self.emitInline(0, line);
+            },
+        }
+    }
 };
 
-fn compoundOp(op: ast.AssignOp) Op {
+fn compoundBinOp(op: ast.AssignOp) ast.BinOp {
     return switch (op) {
         .add => .add,
         .sub => .sub,
@@ -945,13 +1081,12 @@ fn compoundOp(op: ast.AssignOp) Op {
         .mod => .mod,
         .pow => .pow,
         .concat => .concat,
-        .coalesce => .coalesce, // [old rhs] -> winner
+        .coalesce => unreachable,
         .assign => unreachable,
     };
 }
 
 /// Evaluate a compile-time constant expression (literal / unary minus).
-/// Returns null when not constant.
 fn constEval(e: *ast.Expr) ?Value {
     return switch (e.kind) {
         .int_lit => |i| Value{ .int_ = i },
