@@ -251,6 +251,30 @@ test "uncaught exception is fatal" {
 }
 
 // ===========================================================================
+// Float formatting & numeric-string arithmetic (PHP 8 alignment)
+// ===========================================================================
+
+test "float formatting matches precision-14 gcvt" {
+    try expectOut("echo 8.0, '|', 0.1+0.2, '|', 12345678901234.567;", "8|0.3|12345678901235");
+    try expectOut("echo 123456789012345.6, '|', 1.0e15, '|', 1.5e15;", "1.2345678901235E+14|1.0E+15|1.5E+15");
+    try expectOut("echo 1e-10, '|', -2.5e20, '|', 99999999999999.0;", "1.0E-10|-2.5E+20|99999999999999");
+    // all-nines carry into the exponent
+    try expectOut("echo 9.999999999999999e13;", "1.0E+14");
+}
+
+test "leading-numeric strings warn but compute" {
+    // Warning goes to stderr; stdout carries the computed result.
+    try expectOut("echo '5 apples' + 1, '|', '123abc' * 2;", "6|246");
+}
+
+test "non-numeric strings throw a catchable TypeError" {
+    try expectOut("try { echo 'abc' + 1; } catch (Throwable $e) { echo $e->getMessage(); }",
+        "Unsupported operand types: string + int");
+    try expectOut("try { echo '' * 2; } catch (Throwable $e) { echo $e->getMessage(); }",
+        "Unsupported operand types: string * int");
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 
@@ -269,14 +293,13 @@ test "float arithmetic" {
     try expectOut("echo 10 / 4;", "2.5");
     try expectOut("echo 10 / 2;", "5"); // exact division stays int
     try expectOut("echo 1.5 + 1.5;", "3");
-    try expectOut("echo 0.1 + 0.2;", "0.30000000000000004");
+    try expectOut("echo 0.1 + 0.2;", "0.3"); // precision-14, matches PHP
     try expectOut("echo 7 % 2.5;", "1"); // float mod truncates to ints
     try expectOut("echo 2 ** -1;", "0.5");
 }
 
 test "overflow promotes to float" {
-    // Deviation: PHP prints "9.2233720368548E+18"; we use Zig's decimal form.
-    try expectOut("echo 9223372036854775807 + 1;", "9223372036854776000");
+    try expectOut("echo 9223372036854775807 + 1;", "9.2233720368548E+18"); // matches PHP
 }
 
 test "numeric literals" {
@@ -288,8 +311,9 @@ test "numeric literals" {
 
 test "string-number coercion in arithmetic" {
     try expectOut("echo '5' + '6';", "11");
-    try expectOut("echo '5 apples' + 1;", "6"); // leading number wins
-    try expectOut("echo 'abc' * 2;", "0"); // no leading number -> 0
+    try expectOut("echo '5 apples' + 1;", "6"); // leading number wins (+ stderr warning)
+    try expectOut("try { echo 'abc' * 2; } catch (Throwable $e) { echo $e->getMessage(); }",
+        "Unsupported operand types: string * int"); // PHP 8: fatal, not 0
     try expectOut("echo '3.14' * 2;", "6.28");
     try expectOut("echo '  12  ' + 1;", "13"); // leading whitespace ok
 }

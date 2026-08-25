@@ -272,14 +272,132 @@ pub fn toString(v: Value, a: std.mem.Allocator) ![]const u8 {
     };
 }
 
+/// PHP float-to-string with precision=14 (zend_gcvt semantics):
+///   - scientific notation when decimal exponent < -4 or >= 14,
+///   - otherwise fixed notation,
+///   - trailing zeros stripped; integral values print without a fraction
+///     ("8", not "8.0"), single-digit mantissa keeps ".0" ("1.0E+15").
 pub fn fmtFloat(f: f64, a: std.mem.Allocator) error{OutOfMemory}![]const u8 {
     if (std.math.isNan(f)) return "NAN";
     if (std.math.isPositiveInf(f)) return "INF";
     if (std.math.isNegativeInf(f)) return "-INF";
-    if (@abs(f) < 9.007199254740992e15 and f == @trunc(f)) {
-        return std.fmt.allocPrint(a, "{d}", .{@as(i64, @intFromFloat(f))});
+
+    const neg = std.math.signbit(f);
+    const av = @abs(f);
+    if (av == 0) return if (neg) "-0" else "0";
+
+    // Shortest-round-trip scientific decomposition from the std formatter.
+    var sbuf: [64]u8 = undefined;
+    const sci = std.fmt.bufPrint(&sbuf, "{e}", .{av}) catch unreachable;
+
+    // Split into digits and decimal exponent: av = D.DDD × 10^exp10.
+    var digits: [40]u8 = undefined;
+    var n: usize = 0;
+    var exp10: i32 = 0;
+    {
+        const epos = std.mem.indexOfScalar(u8, sci, 'e') orelse unreachable;
+        exp10 = std.fmt.parseInt(i32, sci[epos + 1 ..], 10) catch 0;
+        for (sci[0..epos]) |ch| {
+            if (ch >= '0' and ch <= '9') {
+                digits[n] = ch;
+                n += 1;
+            }
+        }
     }
-    return std.fmt.allocPrint(a, "{d}", .{f});
+
+    // Round to 14 significant digits (half-up), carrying into the exponent
+    // (all-nines -> leading 1).
+    const P: usize = 14;
+    if (n > P) {
+        const round_up = digits[P] >= '5';
+        n = P;
+        if (round_up) {
+            var i = n;
+            var carried_out = false;
+            while (i > 0) {
+                i -= 1;
+                if (digits[i] == '9') {
+                    digits[i] = '0';
+                    if (i == 0) carried_out = true;
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+            if (carried_out) {
+                var j: usize = n;
+                while (j > 0) : (j -= 1) digits[j] = digits[j - 1];
+                digits[0] = '1';
+                n += 1;
+                exp10 += 1;
+            }
+        }
+    }
+    while (n > 1 and digits[n - 1] == '0') n -= 1;
+
+    // Build into a stack buffer, then return an exact-length copy so
+    // callers that free (testing allocator) see a clean allocation.
+    var out_buf: [80]u8 = undefined;
+    const out = &out_buf;
+    var w: usize = 0;
+    if (neg) {
+        out[w] = '-';
+        w += 1;
+    }
+
+    if (exp10 < -4 or exp10 >= 14) {
+        // Scientific: D[.rest]E±XX.
+        out[w] = digits[0];
+        w += 1;
+        out[w] = '.';
+        w += 1;
+        if (n == 1) {
+            out[w] = '0';
+            w += 1;
+        } else {
+            @memcpy(out[w..][0 .. n - 1], digits[1..n]);
+            w += n - 1;
+        }
+        out[w] = 'E';
+        w += 1;
+        out[w] = if (exp10 < 0) '-' else '+';
+        w += 1;
+        const e_abs: u32 = @intCast(if (exp10 < 0) -exp10 else exp10);
+        const es = std.fmt.bufPrint(out[w..], "{d}", .{e_abs}) catch unreachable;
+        w += es.len;
+    } else {
+        // Fixed notation; integral values have no fraction.
+        const ip: i32 = exp10 + 1; // digits before the decimal point
+        if (ip <= 0) {
+            out[w] = '0';
+            w += 1;
+            out[w] = '.';
+            w += 1;
+            var z: i32 = 0;
+            while (z < -ip) : (z += 1) {
+                out[w] = '0';
+                w += 1;
+            }
+            @memcpy(out[w..][0..n], digits[0..n]);
+            w += n;
+        } else if (@as(usize, @intCast(ip)) >= n) {
+            @memcpy(out[w..][0..n], digits[0..n]);
+            w += n;
+            const total: usize = @intCast(ip);
+            while (w < total + @as(usize, if (neg) 1 else 0)) : (w += 1) {
+                out[w] = '0';
+            }
+        } else {
+            const split: usize = @intCast(ip);
+            @memcpy(out[w..][0..split], digits[0..split]);
+            w += split;
+            out[w] = '.';
+            w += 1;
+            @memcpy(out[w..][0 .. n - split], digits[split..n]);
+            w += n - split;
+        }
+    }
+    return a.dupe(u8, out[0..w]);
 }
 
 /// Normalize a value into an array key following PHP rules:

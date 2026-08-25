@@ -690,8 +690,39 @@ pub const Vm = struct {
     }
 
     fn arithRaw(self: *Vm, kind: ArithKind, l: Value, r: Value, line: u32) Error!Value {
-        if (l == .array_ or r == .array_) {
+        if (l == .array_ or r == .array_ or l == .obj_ or r == .obj_) {
             return self.fatalF(line, "unsupported operand types: {s} and {s}", .{ l.typeName(), r.typeName() });
+        }
+        // PHP 8 string arithmetic rules:
+        //   fully numeric           -> clean
+        //   leading-numeric ("5x")  -> Warning "A non-numeric value encountered"
+        //   non-numeric ("abc", "") -> fatal TypeError, order-aware message
+        inline for ([2]Value{ l, r }) |side| {
+            switch (side) {
+                .str_, .rope_ => {
+                    const s = try valmod.toString(side, self.arena);
+                    if (valmod.numericString(s) == null) {
+                        const t = std.mem.trimStart(u8, s, " \t\n\r\x0b\x0c");
+                        const has_numeric_prefix = blk: {
+                            if (t.len == 0) break :blk false;
+                            var i: usize = 0;
+                            if (t[0] == '+' or t[0] == '-') i = 1;
+                            break :blk i < t.len and (std.ascii.isDigit(t[i]) or t[i] == '.');
+                        };
+                        if (!has_numeric_prefix) {
+                            const op_sym: []const u8 = switch (kind) {
+                                .add => "+", .sub => "-", .mul => "*",
+                                .div => "/", .mod => "%", .pow => "**",
+                            };
+                            const msg = try std.fmt.allocPrint(self.arena, "Unsupported operand types: {s} {s} {s}", .{ l.typeName(), op_sym, r.typeName() });
+                            try self.throwBuiltin(line, "TypeError", msg);
+                            return .null_;
+                        }
+                        self.warn(line, "A non-numeric value encountered", .{});
+                    }
+                },
+                else => {},
+            }
         }
         const ln = valmod.toNumber(l, self.arena);
         const rn = valmod.toNumber(r, self.arena);

@@ -121,8 +121,15 @@ pub fn main(init: std.process.Init) !u8 {
         error.Fatal => {
             try out.flush();
             err_w.flush() catch {};
-            try errPrint("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
-            try out.print("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+            // Exception-derived fatals already carry "Uncaught <Class>: ...";
+            // plain internal errors get the generic prefix.
+            if (std.mem.startsWith(u8, vm.msg, "Uncaught ")) {
+                try errPrint("PHP Fatal error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+                try out.print("PHP Fatal error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+            } else {
+                try errPrint("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+                try out.print("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+            }
             try out.flush();
             return 255;
         },
