@@ -128,7 +128,7 @@ test "deeply nested expressions survive register pressure" {
     try buf.appendSlice(alloc, ";");
 
     const tests_impl = @import("tests_impl.zig");
-    const r = try tests_impl.runCodeEngine(.vm, buf.items);
+    const r = try tests_impl.runCode(buf.items);
     defer r.deinit();
     try t.expect(r.fatal == null);
     // sum(1..60) + 1 = 1831

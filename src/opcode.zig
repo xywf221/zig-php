@@ -68,6 +68,8 @@ pub const Op = enum(u8) {
     to_bool,
     bit_not,
     is_not_null,
+    /// Warn "Undefined variable $consts[a]" (no runtime effect).
+    warn_undef,
     /// a = (b !== null) ? b : c
     coalesce,
 

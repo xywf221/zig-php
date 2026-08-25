@@ -41,6 +41,8 @@ pub const Compiler = struct {
     const FnCtx = struct {
         func: *Func,
         locals: std.StringHashMapUnmanaged(usize) = .empty,
+        /// Slots proven assigned before a read (flow-insensitive).
+        defined: std.AutoHashMapUnmanaged(usize, void) = .empty,
         next_temp: u32 = 0,
         free_list: std.ArrayList(u32) = .empty,
         nhidden: u32 = 0,
@@ -53,6 +55,10 @@ pub const Compiler = struct {
             try self.locals.put(a, name, slot);
             self.func.nlocals = @max(self.func.nlocals, slot + 1);
             return slot;
+        }
+
+        fn markDefined(self: *FnCtx, slot: usize) void {
+            self.defined.put(self.arena, slot, {}) catch {};
         }
 
         fn alloc(self: *FnCtx) u32 {
@@ -280,7 +286,10 @@ pub const Compiler = struct {
 
         var ctx = FnCtx{ .func = f, .arena = arena };
         // Parameters occupy the first registers.
-        for (fd.params) |p| _ = try ctx.resolveLocal(arena, p.name);
+        for (fd.params) |p| {
+            const pslot = try ctx.resolveLocal(arena, p.name);
+            ctx.markDefined(pslot); // parameters are always defined
+        }
         try reserveLocals(arena, fd.body, &ctx);
         ctx.next_temp = @intCast(f.nlocals);
         var c = Compiler{ .arena = arena, .diag = diag, .ctx = &ctx, .chunk = &f.chunk };
@@ -457,6 +466,11 @@ pub const Compiler = struct {
                 const key_out: u32 = if (fe.key) |_| try self.slotOf(fe.key.?, line) else opcode.no_reg;
                 const val_slot = try self.slotOf(fe.val, line);
                 _ = try self.emit2(.foreach_next, key_out, val_slot, line);
+                self.ctx.markDefined(val_slot);
+                if (fe.key) |k| {
+                    const ks = try self.slotOf(k, line);
+                    self.ctx.markDefined(ks);
+                }
                 _ = try self.emitInline(opcode.packForeach(hidden, fe.key != null), line);
                 const exit_pos = try self.emitInline(0, line);
 
@@ -571,16 +585,41 @@ pub const Compiler = struct {
 
     /// Evaluate an expression; plain variable reads reuse their slot without
     /// a copy (callers must not free unowned registers).
-    fn exprToReg(self: *Compiler, e: *ast.Expr) Error!Reg {
+    fn exprToReg(self: *Compiler, e: *ast.Expr, line: u32) Error!Reg {
         if (e.kind == .var_ref) {
-            const slot = try self.ctx.resolveLocal(self.arena, e.kind.var_ref);
+            const name = e.kind.var_ref;
+            const slot = try self.ctx.resolveLocal(self.arena, name);
+            try self.checkDefined(slot, name, line);
             return .{ .reg = @intCast(slot), .owned = false };
         }
         return self.exprToTemp(e);
     }
 
+    /// Emit an undefined-variable warning instruction for reads of locals
+    /// never assigned anywhere in this function (flow-insensitive).
+    fn checkDefined(self: *Compiler, slot: usize, name: []const u8, line: u32) Error!void {
+        if (self.ctx.defined.contains(slot)) return;
+        const ci = try self.ctx.func.chunk.addConst(self.arena, .{ .str_ = name });
+        _ = try self.emit1(.warn_undef, ci, line);
+    }
+
     fn compileBinary(self: *Compiler, b: anytype, dst: u32, line: u32) Error!void {
         switch (b.op) {
+            .coalesce => {
+                // ?? reads without an undefined warning (PHP semantics).
+                if (b.lhs.kind == .var_ref) {
+                    const slot = try self.ctx.resolveLocal(self.arena, b.lhs.kind.var_ref);
+                    const t = try self.exprToTemp(b.rhs);
+                    _ = try self.emit3(.coalesce, dst, @intCast(slot), t.reg, line);
+                    t.release(&self.ctx);
+                    return;
+                }
+                const t1 = try self.exprToTemp(b.lhs);
+                const t2 = try self.exprToTemp(b.rhs);
+                _ = try self.emit3(.coalesce, dst, t1.reg, t2.reg, line);
+                t2.release(&self.ctx);
+                t1.release(&self.ctx);
+            },
             .logic_and => {
                 const t1 = try self.exprToTemp(b.lhs);
                 _ = try self.emit2(.to_bool, t1.reg, t1.reg, line);
@@ -605,13 +644,6 @@ pub const Compiler = struct {
                 try self.patchB(jt);
                 t1.release(&self.ctx);
             },
-            .coalesce => {
-                const t1 = try self.exprToTemp(b.lhs);
-                const t2 = try self.exprToTemp(b.rhs);
-                _ = try self.emit3(.coalesce, dst, t1.reg, t2.reg, line);
-                t2.release(&self.ctx);
-                t1.release(&self.ctx);
-            },
             .logic_xor => {
                 const t1 = try self.exprToTemp(b.lhs);
                 const t2 = try self.exprToTemp(b.rhs);
@@ -623,8 +655,8 @@ pub const Compiler = struct {
                 t1.release(&self.ctx);
             },
             else => {
-                const r1 = try self.exprToReg(b.lhs);
-                const r2 = try self.exprToReg(b.rhs);
+                const r1 = try self.exprToReg(b.lhs, line);
+                const r2 = try self.exprToReg(b.rhs, line);
                 _ = try self.emit3(binOpOf(b.op), dst, r1.reg, r2.reg, line);
                 r2.release(&self.ctx);
                 r1.release(&self.ctx);
@@ -652,6 +684,7 @@ pub const Compiler = struct {
 
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
+                try self.checkDefined(slot, name, line);
                 if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
             },
 
@@ -671,10 +704,12 @@ pub const Compiler = struct {
                         },
                         .var_ref => |name| {
                             const slot = try self.ctx.resolveLocal(self.arena, name);
+                            try self.checkDefined(slot, name, line);
                             _ = try self.emit2(.mov, r, @intCast(slot), line);
                         },
                         .var_index => |vi| {
                             const slot = try self.ctx.resolveLocal(self.arena, vi.name);
+                            try self.checkDefined(slot, vi.name, line);
                             _ = try self.emit2(.mov, r, @intCast(slot), line);
                             for (vi.keys) |key| {
                                 const tk = self.ctx.alloc();
@@ -772,7 +807,7 @@ pub const Compiler = struct {
             },
 
             .index => |ix| {
-                const tb = try self.exprToReg(ix.base);
+                const tb = try self.exprToReg(ix.base, line);
                 const tk = try self.exprToTemp(ix.index orelse {
                     return self.fail(line, "cannot read from array without an index", .{});
                 });
@@ -806,7 +841,7 @@ pub const Compiler = struct {
                 _ = try self.emit2(.isset_local, dst, @intCast(slot), line);
             },
             .index => |ix| {
-                const tb = try self.exprToReg(ix.base);
+                const tb = try self.exprToReg(ix.base, line);
                 const tk = try self.exprToTemp(ix.index orelse {
                     return self.fail(line, "invalid isset() operand", .{});
                 });
@@ -850,16 +885,23 @@ pub const Compiler = struct {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
                 switch (a.op) {
-                    .assign => try self.compileInto(@intCast(slot), a.value),
+                    .assign => {
+                        try self.compileInto(@intCast(slot), a.value);
+                        self.ctx.markDefined(slot);
+                    },
                     .coalesce => {
-                        const tv = try self.exprToReg(a.value);
+                        const tv = try self.exprToReg(a.value, line);
                         _ = try self.emit3(.coalesce, @intCast(slot), @intCast(slot), tv.reg, line);
                         tv.release(&self.ctx);
+                        self.ctx.markDefined(slot);
                     },
                     else => {
-                        const tv = try self.exprToReg(a.value);
+                        // Reading the target is itself a potential undef read.
+                        try self.checkDefined(slot, name, line);
+                        const tv = try self.exprToReg(a.value, line);
                         _ = try self.emit3(binOpOf(compoundBinOp(a.op)), @intCast(slot), @intCast(slot), tv.reg, line);
                         tv.release(&self.ctx);
+                        self.ctx.markDefined(slot);
                     },
                 }
                 if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
@@ -924,6 +966,7 @@ pub const Compiler = struct {
         switch (target.kind) {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
+                try self.checkDefined(slot, name, line);
                 if (postfix) {
                     // dst = old; slot = old +/- 1
                     const op: Op = if (up) .post_inc_l else .post_dec_l;
@@ -934,6 +977,7 @@ pub const Compiler = struct {
                     _ = try self.emit1(op, @intCast(slot), line);
                     if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
                 }
+                self.ctx.markDefined(slot);
             },
             .index => |ix| {
                 const parent = self.ctx.alloc();

@@ -7,7 +7,6 @@ comptime {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
     _ = @import("value.zig");
-    _ = @import("interp.zig");
     _ = @import("test_lexer.zig");
     _ = @import("test_parser.zig");
     _ = @import("tests_impl.zig");

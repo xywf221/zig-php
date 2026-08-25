@@ -19,6 +19,10 @@ pub const Chunk = struct {
     code: std.ArrayList(Instr) = .empty,
     lines: std.ArrayList(u32) = .empty,
     consts: std.ArrayList(Value) = .empty,
+    /// Hash dedup for the high-volume constant kinds; float/bool/null are
+    /// rare and fall back to a short linear scan.
+    int_ix: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    str_ix: std.StringHashMapUnmanaged(u32) = .empty,
 
     pub fn emit(self: *Chunk, a: std.mem.Allocator, ins: Instr, line: u32) !usize {
         try self.code.append(a, ins);
@@ -27,17 +31,28 @@ pub const Chunk = struct {
     }
 
     pub fn addConst(self: *Chunk, a: std.mem.Allocator, v: Value) !u32 {
-        // Deduplicate identical immutable constants.
-        for (self.consts.items, 0..) |c, i| {
-            if (valmod.strictEq(c, v)) {
-                switch (v) {
-                    .null_, .bool_, .int_, .float_, .str_ => return @intCast(i),
-                    .array_ => {},
+        switch (v) {
+            .int_ => |i| {
+                if (self.int_ix.get(i)) |ix| return ix;
+            },
+            .str_ => |s| {
+                if (self.str_ix.get(s)) |ix| return ix;
+            },
+            .null_, .bool_, .float_, .array_ => {
+                for (self.consts.items, 0..) |c, i| {
+                    if (try valmod.strictEq(c, v, a)) return @intCast(i);
                 }
-            }
+            },
+            else => {},
         }
+        const ix: u32 = @intCast(self.consts.items.len);
         try self.consts.append(a, v);
-        return @intCast(self.consts.items.len - 1);
+        switch (v) {
+            .int_ => |i| try self.int_ix.put(a, i, ix),
+            .str_ => |s| try self.str_ix.put(a, s, ix),
+            else => {},
+        }
+        return ix;
     }
 };
 

@@ -30,12 +30,16 @@ pub const MAX_CALL_DEPTH: u32 = 512;
 pub const Vm = struct {
     arena: std.mem.Allocator,
     out: *std.Io.Writer,
+    /// Warning stream (stderr); null disables warnings.
+    err: ?*std.Io.Writer,
     program: *compiler_mod.Program,
     /// Functions registered so far (conditional declarations register when
     /// execution reaches them).
     funcs: std.StringHashMapUnmanaged(*Func) = .empty,
 
     frames: std.ArrayList(Frame) = .empty,
+    /// Pooled register files for call frames (bounded recycling).
+    reg_pool: std.ArrayList([]Value) = .empty,
 
     // Diagnostics.
     msg: []const u8 = "",
@@ -51,8 +55,8 @@ pub const Vm = struct {
         result_reg: u32,
     };
 
-    pub fn init(arena: std.mem.Allocator, out: *std.Io.Writer, program: *compiler_mod.Program) Vm {
-        var vm = Vm{ .arena = arena, .out = out, .program = program };
+    pub fn init(arena: std.mem.Allocator, out: *std.Io.Writer, err: ?*std.Io.Writer, program: *compiler_mod.Program) Vm {
+        var vm = Vm{ .arena = arena, .out = out, .err = err, .program = program };
         // Preload only unconditional top-level declarations (PHP hoisting);
         // conditional ones register via declare_func when execution reaches
         // them.
@@ -71,8 +75,24 @@ pub const Vm = struct {
         return error.Fatal;
     }
 
+    /// Emit a PHP-style warning to stderr (stdout output is unaffected).
+    fn warn(self: *Vm, line: u32, comptime fmt: []const u8, args: anytype) void {
+        const e = self.err orelse return;
+        e.print("Warning: " ++ fmt ++ " in zphp on line {d}\n", args ++ .{line}) catch {};
+    }
+
     fn newFrameRegs(self: *Vm, f: *Func) Error![]Value {
-        const regs = try self.arena.alloc(Value, f.nlocals + f.ntemps);
+        const need = f.nlocals + f.ntemps;
+        // Reuse a pooled register file when one is big enough.
+        if (self.reg_pool.items.len > 0) {
+            const last = self.reg_pool.items[self.reg_pool.items.len - 1];
+            if (last.len >= need) {
+                _ = self.reg_pool.pop();
+                for (last[0..f.nlocals]) |*r| r.* = .null_;
+                return last[0..need];
+            }
+        }
+        const regs = try self.arena.alloc(Value, need);
         // Locals must start as null (undefined-variable semantics);
         // temporaries are always written before read, so leaving them
         // uninitialized is safe.
@@ -202,9 +222,19 @@ pub const Vm = struct {
                 .mod => regs[ins.a] = try self.arithRaw(.mod, regs[ins.b], regs[ins.c], line),
                 .pow => regs[ins.a] = try self.arithRaw(.pow, regs[ins.b], regs[ins.c], line),
                 .concat => {
+                    // Rope cons when the left side is already string-shaped:
+                    // repeated `.=`/`.` chains become O(total) instead of
+                    // O(n^2) copying. Materialization is deferred until raw
+                    // bytes are needed.
+                    const l = regs[ins.b];
                     const r = try valmod.toString(regs[ins.c], self.arena);
-                    const l = try valmod.toString(regs[ins.b], self.arena);
-                    regs[ins.a] = .{ .str_ = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ l, r }) };
+                    regs[ins.a] = switch (l) {
+                        .str_, .rope_ => .{ .rope_ = try valmod.Rope.cons(self.arena, l, r) },
+                        else => blk: {
+                            const ls = try valmod.toString(l, self.arena);
+                            break :blk .{ .str_ = try std.mem.concat(self.arena, u8, &.{ ls, r }) };
+                        },
+                    };
                 },
 
                 .bit_and => regs[ins.a] = try self.intBin(.bit_and, regs[ins.b], regs[ins.c]),
@@ -227,14 +257,14 @@ pub const Vm = struct {
                         .gt => 1,
                     } };
                 },
-                .identical => regs[ins.a] = .{ .bool_ = valmod.strictEq(regs[ins.b], regs[ins.c]) },
-                .not_identical => regs[ins.a] = .{ .bool_ = !valmod.strictEq(regs[ins.b], regs[ins.c]) },
+                .identical => regs[ins.a] = .{ .bool_ = try valmod.strictEq(regs[ins.b], regs[ins.c], self.arena) },
+                .not_identical => regs[ins.a] = .{ .bool_ = !try valmod.strictEq(regs[ins.b], regs[ins.c], self.arena) },
 
-                .neg => regs[ins.a] = switch (valmod.toNumber(regs[ins.b])) {
+                .neg => regs[ins.a] = switch (valmod.toNumber(regs[ins.b], self.arena)) {
                     .int => |i| Value{ .int_ = -i },
                     .float => |fl| Value{ .float_ = -fl },
                 },
-                .pos => regs[ins.a] = switch (valmod.toNumber(regs[ins.b])) {
+                .pos => regs[ins.a] = switch (valmod.toNumber(regs[ins.b], self.arena)) {
                     .int => |i| Value{ .int_ = i },
                     .float => |fl| Value{ .float_ = fl },
                 },
@@ -242,9 +272,13 @@ pub const Vm = struct {
                 .to_bool => regs[ins.a] = .{ .bool_ = regs[ins.b].truthy() },
                 .bit_not => {
                     if (regs[ins.b] == .float_) return self.fatalF(line, "unsupported operand type for ~", .{});
-                    regs[ins.a] = .{ .int_ = ~valmod.toNumber(regs[ins.b]).int };
+                    regs[ins.a] = .{ .int_ = ~valmod.toNumber(regs[ins.b], self.arena).int };
                 },
                 .is_not_null => regs[ins.a] = .{ .bool_ = regs[ins.b] != .null_ },
+                .warn_undef => {
+                    const name = f.func.chunk.consts.items[ins.a].str_;
+                    self.warn(line, "Undefined variable ${s}", .{name});
+                },
                 .coalesce => regs[ins.a] = if (regs[ins.b] != .null_) regs[ins.b] else regs[ins.c],
 
                 .strconcat => {
@@ -264,16 +298,16 @@ pub const Vm = struct {
                     }
                 },
 
-                .inc_l => regs[ins.a] = incValue(regs[ins.a], true),
-                .dec_l => regs[ins.a] = incValue(regs[ins.a], false),
+                .inc_l => regs[ins.a] = incValue(regs[ins.a], true, self.arena),
+                .dec_l => regs[ins.a] = incValue(regs[ins.a], false, self.arena),
                 .post_inc_l => {
                     const old = regs[ins.b];
-                    regs[ins.b] = incValue(old, true);
+                    regs[ins.b] = incValue(old, true, self.arena);
                     regs[ins.a] = old;
                 },
                 .post_dec_l => {
                     const old = regs[ins.b];
-                    regs[ins.b] = incValue(old, false);
+                    regs[ins.b] = incValue(old, false, self.arena);
                     regs[ins.a] = old;
                 },
                 .inc_idx, .dec_idx => {
@@ -282,7 +316,7 @@ pub const Vm = struct {
                     if (regs[ins.b] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
                     const key = try valmod.makeKey(regs[ins.b], self.arena);
                     const old = container.get(key) orelse .null_;
-                    try container.set(self.arena, key, incValue(old, up));
+                    try container.set(self.arena, key, incValue(old, up, self.arena));
                 },
                 .post_inc_idx, .post_dec_idx => {
                     const up = ins.op == .post_inc_idx;
@@ -291,7 +325,7 @@ pub const Vm = struct {
                     const key = try valmod.makeKey(regs[ins.c], self.arena);
                     const old = container.get(key) orelse .null_;
                     regs[ins.a] = old;
-                    try container.set(self.arena, key, incValue(old, up));
+                    try container.set(self.arena, key, incValue(old, up, self.arena));
                 },
 
                 .call => {
@@ -310,8 +344,15 @@ pub const Vm = struct {
 
                 .foreach_init => {
                     const subject = regs[ins.c];
+                    // PHP iterates a snapshot taken at loop start; in-loop
+                    // mutations must not affect this iteration.
                     const snap: Value = switch (subject) {
-                        .array_ => subject,
+                        .array_ => |arr| blk: {
+                            const copy = try Value.Array.create(self.arena);
+                            try copy.entries.appendSlice(self.arena, arr.entries.items);
+                            copy.next_index = arr.next_index;
+                            break :blk .{ .array_ = copy };
+                        },
                         .null_ => .{ .array_ = try Value.Array.create(self.arena) },
                         else => return self.fatalF(line, "foreach() argument must be of type array, {s} given", .{subject.typeName()}),
                     };
@@ -440,11 +481,15 @@ pub const Vm = struct {
         switch (base) {
             .array_ => |arr| {
                 if (key_v == .array_) return self.fatalF(line, "illegal offset type: array", .{});
-                return arr.get(try valmod.makeKey(key_v, self.arena)) orelse .null_;
+                const key = try valmod.makeKey(key_v, self.arena);
+                if (arr.get(key)) |v| return v;
+                const ks = try valmod.toString(key_v, self.arena);
+                self.warn(line, "Undefined array key \"{s}\"", .{ks});
+                return .null_;
             },
             .str_ => |st| {
                 if (key_v != .int_ and key_v != .float_) return .{ .str_ = "" };
-                const fl = valmod.toNumber(key_v).toFloat();
+                const fl = valmod.toNumber(key_v, self.arena).toFloat();
                 if (fl < 0 or fl >= @as(f64, @floatFromInt(st.len))) return .{ .str_ = "" };
                 const i: usize = @intFromFloat(fl);
                 return .{ .str_ = st[i .. i + 1] };
@@ -458,8 +503,8 @@ pub const Vm = struct {
         if (l == .array_ or r == .array_) {
             return self.fatalF(line, "unsupported operand types: {s} and {s}", .{ l.typeName(), r.typeName() });
         }
-        const ln = valmod.toNumber(l);
-        const rn = valmod.toNumber(r);
+        const ln = valmod.toNumber(l, self.arena);
+        const rn = valmod.toNumber(r, self.arena);
 
         if (ln == .int and rn == .int) {
             const x = ln.int;
@@ -520,9 +565,8 @@ pub const Vm = struct {
     }
 
     fn intBin(self: *Vm, kind: BitKind, l: Value, r: Value) Error!Value {
-        _ = self;
-        const li = valmod.toNumber(l).int;
-        const ri = valmod.toNumber(r).int;
+        const li = valmod.toNumber(l, self.arena).int;
+        const ri = valmod.toNumber(r, self.arena).int;
         const result: i64 = switch (kind) {
             .bit_and => li & ri,
             .bit_or => li | ri,
@@ -533,14 +577,16 @@ pub const Vm = struct {
         return .{ .int_ = result };
     }
 
-    fn incValue(old: Value, up: bool) Value {
+    fn incValue(old: Value, up: bool, mem: std.mem.Allocator) Value {
         if (old == .null_) {
             return if (up) Value{ .int_ = 1 } else Value.null_;
         }
+        // Non-numeric strings are untouched (PHP semantics); a rope is
+        // "touched" only if it holds numeric content, which toNumber handles.
         if (old == .str_ and valmod.numericString(old.str_) == null) {
-            return old; // non-numeric strings untouched (PHP semantics)
+            return old;
         }
-        const n = valmod.toNumber(old);
+        const n = valmod.toNumber(old, mem);
         return switch (n) {
             .int => |i| Value{ .int_ = if (up) i +% 1 else i -% 1 },
             .float => |fl| Value{ .float_ = if (up) fl + 1 else fl - 1 },
@@ -598,6 +644,8 @@ pub const Vm = struct {
 
     fn popFrame(self: *Vm, result: Value) Error!void {
         const frame = self.frames.pop().?;
+        // Recycle the register file (bounded pool; arena frees the rest).
+        if (self.reg_pool.items.len < 64) try self.reg_pool.append(self.arena, frame.regs);
         if (self.frames.items.len > 0 and frame.result_reg != opcode.no_reg) {
             const caller = &self.frames.items[self.frames.items.len - 1];
             caller.regs[frame.result_reg] = result;

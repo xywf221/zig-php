@@ -114,12 +114,12 @@ fn asStr(in: *Vm, v: Value) Error![]const u8 {
     return valmod.toString(v, in.arena);
 }
 
-fn wantInt(v: Value) i64 {
-    return valmod.toNumber(v).int;
+fn wantInt(in: *Vm, v: Value) i64 {
+    return valmod.toNumber(v, in.arena).int;
 }
 
-fn wantFloat(v: Value) f64 {
-    return valmod.toNumber(v).toFloat();
+fn wantFloat(in: *Vm, v: Value) f64 {
+    return valmod.toNumber(v, in.arena).toFloat();
 }
 
 fn wantArray(in: *Vm, v: Value, fname: []const u8) Error!*Value.Array {
@@ -163,14 +163,14 @@ fn fn_strrev(in: *Vm, args: []const Value) Error!Value {
 fn fn_substr(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 3, "substr($string, $offset, $length = null)");
     const s = try asStr(in, args[0]);
-    var start = wantInt(args[1]);
+    var start = wantInt(in, args[1]);
     if (start < 0) start += @intCast(s.len);
     if (start < 0 or start >= s.len) return .{ .str_ = "" };
     const from: usize = @intCast(start);
 
     if (args.len == 2) return .{ .str_ = s[from..] };
 
-    var len = wantInt(args[2]);
+    var len = wantInt(in, args[2]);
     if (len < 0) len += @intCast(s.len - from);
     if (len <= 0) return .{ .str_ = "" };
     const to = @min(from + @as(usize, @intCast(len)), s.len);
@@ -181,7 +181,7 @@ fn fn_strpos(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 3, "strpos($haystack, $needle, $offset = 0)");
     const hay = try asStr(in, args[0]);
     const needle = try asStr(in, args[1]);
-    var offset = if (args.len == 3) wantInt(args[2]) else 0;
+    var offset = if (args.len == 3) wantInt(in, args[2]) else 0;
     if (offset < 0) offset += @intCast(hay.len);
     if (offset < 0 or offset >= hay.len) return .{ .bool_ = false };
     const idx = std.mem.indexOfPos(u8, hay, @intCast(offset), needle) orelse return .{ .bool_ = false };
@@ -191,7 +191,7 @@ fn fn_strpos(in: *Vm, args: []const Value) Error!Value {
 fn fn_str_repeat(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 2, "str_repeat($string, $times)");
     const st = try asStr(in, args[0]);
-    const times = wantInt(args[1]);
+    const times = wantInt(in, args[1]);
     if (times <= 0) return .{ .str_ = "" };
     const n: usize = @intCast(times);
     if (st.len * n > 256 * 1024 * 1024) {
@@ -283,13 +283,13 @@ fn fn_sprintf(in: *Vm, args: []const Value) Error!Value {
         switch (fmt[i]) {
             '%' => try out.append(in.arena, '%'),
             's' => try out.appendSlice(in.arena, try asStr(in, next_arg)),
-            'd' => try out.print(in.arena, "{d}", .{wantInt(next_arg)}),
-            'f' => try out.print(in.arena, "{d}", .{wantFloat(next_arg)}),
-            'x' => try out.print(in.arena, "{x}", .{wantInt(next_arg)}),
-            'X' => try out.print(in.arena, "{X}", .{wantInt(next_arg)}),
-            'o' => try out.print(in.arena, "{o}", .{wantInt(next_arg)}),
-            'b' => try out.print(in.arena, "{b}", .{wantInt(next_arg)}),
-            'e', 'E' => try out.print(in.arena, "{e}", .{wantFloat(next_arg)}),
+            'd' => try out.print(in.arena, "{d}", .{wantInt(in, next_arg)}),
+            'f' => try out.print(in.arena, "{d}", .{wantFloat(in, next_arg)}),
+            'x' => try out.print(in.arena, "{x}", .{wantInt(in, next_arg)}),
+            'X' => try out.print(in.arena, "{X}", .{wantInt(in, next_arg)}),
+            'o' => try out.print(in.arena, "{o}", .{wantInt(in, next_arg)}),
+            'b' => try out.print(in.arena, "{b}", .{wantInt(in, next_arg)}),
+            'e', 'E' => try out.print(in.arena, "{e}", .{wantFloat(in, next_arg)}),
             else => {
                 try out.append(in.arena, '%');
                 try out.append(in.arena, fmt[i]);
@@ -317,23 +317,14 @@ fn fn_array_push(in: *Vm, args: []const Value) Error!Value {
     return .{ .int_ = @intCast(arr.count()) };
 }
 
-fn reindex(arr: *Value.Array) void {
-    var idx: i64 = 0;
-    for (arr.entries.items) |*e| {
-        if (e.key == .int) {
-            e.key = .{ .int = idx };
-            idx += 1;
-        }
-    }
-    arr.next_index = idx;
-}
+// (Array.reindex lives in value.zig)
 
 fn fn_array_pop(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "array_pop($array)");
     const arr = try wantArray(in, args[0], "array_pop");
     if (arr.entries.items.len == 0) return .null_;
     const last = arr.entries.pop().?.val;
-    reindex(arr);
+    arr.reindex(in.arena);
     return last;
 }
 
@@ -342,7 +333,7 @@ fn fn_array_shift(in: *Vm, args: []const Value) Error!Value {
     const arr = try wantArray(in, args[0], "array_shift");
     if (arr.entries.items.len == 0) return .null_;
     const first = arr.entries.orderedRemove(0).val;
-    reindex(arr);
+    arr.reindex(in.arena);
     return first;
 }
 
@@ -352,7 +343,7 @@ fn fn_array_unshift(in: *Vm, args: []const Value) Error!Value {
     for (args[1..], 0..) |v, ins_i| {
         try arr.entries.insert(in.arena, ins_i, .{ .key = .{ .int = 0 }, .val = v });
     }
-    reindex(arr);
+    arr.reindex(in.arena);
     return .{ .int_ = @intCast(arr.count()) };
 }
 
@@ -393,7 +384,7 @@ fn fn_array_sum(in: *Vm, args: []const Value) Error!Value {
     var acc_i: i64 = 0;
     var any_float = false;
     for (arr.entries.items) |e| {
-        const n = valmod.toNumber(e.val);
+        const n = valmod.toNumber(e.val, in.arena);
         switch (n) {
             .int => |iv| acc_i +%= iv,
             .float => |fv| {
@@ -427,7 +418,7 @@ fn fn_in_array(in: *Vm, args: []const Value) Error!Value {
     const strict = if (args.len == 3) args[2].truthy() else false;
     for (arr.entries.items) |e| {
         const found = if (strict)
-            valmod.strictEq(e.val, args[0])
+            try valmod.strictEq(e.val, args[0], in.arena)
         else
             try valmod.looseEq(e.val, args[0], in.arena);
         if (found) return .{ .bool_ = true };
@@ -469,10 +460,10 @@ fn fn_explode(in: *Vm, args: []const Value) Error!Value {
 
 fn fn_range(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 3, "range($start, $end, $step = 1)");
-    var step: i64 = if (args.len == 3) wantInt(args[2]) else 1;
+    var step: i64 = if (args.len == 3) wantInt(in, args[2]) else 1;
     if (step == 0) step = 1;
-    const start = wantInt(args[0]);
-    const end = wantInt(args[1]);
+    const start = wantInt(in, args[0]);
+    const end = wantInt(in, args[1]);
     const out = try Value.Array.create(in.arena);
     if (step > 0) {
         var iv = start;
@@ -488,7 +479,7 @@ fn fn_range(in: *Vm, args: []const Value) Error!Value {
 
 fn fn_abs(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "abs($num)");
-    return switch (valmod.toNumber(args[0])) {
+    return switch (valmod.toNumber(args[0], in.arena)) {
         .int => |i| .{ .int_ = if (i == std.math.minInt(i64)) i else @intCast(@abs(i)) },
         .float => |f| .{ .float_ = @abs(f) },
     };
@@ -530,19 +521,19 @@ fn fn_min(in: *Vm, args: []const Value) Error!Value {
 
 fn fn_sqrt(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "sqrt($num)");
-    const f = wantFloat(args[0]);
+    const f = wantFloat(in, args[0]);
     if (f < 0) return .{ .float_ = std.math.nan(f64) };
     return .{ .float_ = @sqrt(f) };
 }
 
 fn fn_floor(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "floor($num)");
-    return .{ .float_ = @floor(wantFloat(args[0])) };
+    return .{ .float_ = @floor(wantFloat(in, args[0])) };
 }
 
 fn fn_ceil(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "ceil($num)");
-    return .{ .float_ = @ceil(wantFloat(args[0])) };
+    return .{ .float_ = @ceil(wantFloat(in, args[0])) };
 }
 
 fn roundHalfAway(f: f64, precision: i64) f64 {
@@ -553,15 +544,15 @@ fn roundHalfAway(f: f64, precision: i64) f64 {
 
 fn fn_round(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 2, "round($num, $precision = 0)");
-    const f = wantFloat(args[0]);
-    const precision: i64 = if (args.len == 2) wantInt(args[1]) else 0;
+    const f = wantFloat(in, args[0]);
+    const precision: i64 = if (args.len == 2) wantInt(in, args[1]) else 0;
     return .{ .float_ = roundHalfAway(f, precision) };
 }
 
 fn fn_pow(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 2, "pow($base, $exp)");
-    const ln = valmod.toNumber(args[0]);
-    const rn = valmod.toNumber(args[1]);
+    const ln = valmod.toNumber(args[0], in.arena);
+    const rn = valmod.toNumber(args[1], in.arena);
     if (ln == .int and rn == .int and rn.int >= 0 and rn.int <= 62) {
         var result: i64 = 1;
         var i: i64 = 0;
@@ -573,9 +564,9 @@ fn fn_pow(in: *Vm, args: []const Value) Error!Value {
 
 fn fn_intdiv(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 2, 2, "intdiv($num1, $num2)");
-    const b = wantInt(args[1]);
+    const b = wantInt(in, args[1]);
     if (b == 0) return in.fatalF(0, "Division by zero", .{});
-    return .{ .int_ = @divTrunc(wantInt(args[0]), b) };
+    return .{ .int_ = @divTrunc(wantInt(in, args[0]), b) };
 }
 
 fn fn_pi(in: *Vm, args: []const Value) Error!Value {
@@ -597,12 +588,12 @@ fn fn_intval(in: *Vm, args: []const Value) Error!Value {
         }
         return .{ .int_ = 0 };
     }
-    return .{ .int_ = wantInt(args[0]) };
+    return .{ .int_ = wantInt(in, args[0]) };
 }
 
 fn fn_floatval(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "floatval($value)");
-    return .{ .float_ = wantFloat(args[0]) };
+    return .{ .float_ = wantFloat(in, args[0]) };
 }
 
 fn fn_strval(in: *Vm, args: []const Value) Error!Value {
@@ -656,7 +647,7 @@ fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
         .bool_ => "boolean",
         .int_ => "integer",
         .float_ => "double",
-        .str_ => "string",
+        .str_, .rope_ => "string",
         .array_ => "array",
     } };
 }
@@ -671,7 +662,10 @@ fn dumpValue(in: *Vm, v: Value, indent: u32) Error!void {
         .bool_ => |b| try in.out.print("{s}bool({s})\n", .{ pad, if (b) "true" else "false" }),
         .int_ => |i| try in.out.print("{s}int({d})\n", .{ pad, i }),
         .float_ => |f| try in.out.print("{s}float({s})\n", .{ pad, try valmod.fmtFloat(f, in.arena) }),
-        .str_ => |st| try in.out.print("{s}string({d}) \"{s}\"\n", .{ pad, st.len, st }),
+        .str_, .rope_ => {
+            const st = try valmod.toString(v, in.arena);
+            try in.out.print("{s}string({d}) \"{s}\"\n", .{ pad, st.len, st });
+        },
         .array_ => {
             const arr = v.array_;
             try in.out.print("{s}array({d}) {{\n", .{ pad, arr.count() });
