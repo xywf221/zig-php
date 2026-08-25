@@ -72,9 +72,11 @@ pub const Vm = struct {
     }
 
     fn newFrameRegs(self: *Vm, f: *Func) Error![]Value {
-        const n = f.nlocals + f.ntemps;
-        const regs = try self.arena.alloc(Value, n);
-        for (regs) |*r| r.* = .null_;
+        const regs = try self.arena.alloc(Value, f.nlocals + f.ntemps);
+        // Locals must start as null (undefined-variable semantics);
+        // temporaries are always written before read, so leaving them
+        // uninitialized is safe.
+        for (regs[0..f.nlocals]) |*r| r.* = .null_;
         return regs;
     }
 
@@ -401,6 +403,17 @@ pub const Vm = struct {
     }
 
     fn cmpBool(self: *Vm, kind: CmpKind, l: Value, r: Value) Error!bool {
+        // Fast path: int-vs-int needs no loose-comparison machinery.
+        if (l == .int_ and r == .int_) {
+            return switch (kind) {
+                .eq => l.int_ == r.int_,
+                .neq => l.int_ != r.int_,
+                .lt => l.int_ < r.int_,
+                .gt => l.int_ > r.int_,
+                .lte => l.int_ <= r.int_,
+                .gte => l.int_ >= r.int_,
+            };
+        }
         return switch (kind) {
             .eq => try valmod.looseEq(l, r, self.arena),
             .neq => !(try valmod.looseEq(l, r, self.arena)),
@@ -544,10 +557,11 @@ pub const Vm = struct {
             }
 
             const caller = &self.frames.items[self.frames.items.len - 1];
-            const args = try self.arena.dupe(Value, caller.regs[base_reg .. base_reg + argc]);
 
             const callee_regs = try self.newFrameRegs(callee);
-            for (args, 0..) |av, i| callee_regs[i] = av;
+            // Copy arguments directly (caller/callee register files never
+            // overlap, so no intermediate buffer is needed).
+            for (0..argc) |i| callee_regs[i] = caller.regs[base_reg + i];
             var i: usize = argc;
             while (i < callee.arity) : (i += 1) {
                 if (i < callee.defaults.len) {

@@ -296,6 +296,16 @@ fn strcmpOrder(a: []const u8, b: []const u8) std.math.Order {
 
 /// Loose comparison (`<`, `>`, `==`) approximating PHP 8 semantics.
 pub fn looseCmp(a: Value, b: Value, mem: std.mem.Allocator) !std.math.Order {
+    // Fast path: identical scalar types compare directly.
+    if (a == .int_ and b == .int_) return std.math.order(a.int_, b.int_);
+    if (a == .str_ and b == .str_) {
+        // PHP 8: two numeric strings compare numerically.
+        if (numericString(a.str_)) |na| {
+            if (numericString(b.str_)) |nb| return numOrder(na.toFloat(), nb.toFloat());
+        }
+        return strcmpOrder(a.str_, b.str_);
+    }
+
     // Booleans (and anything compared against one) compare by truthiness.
     if (a == .bool_ or b == .bool_) {
         const ta = @intFromBool(a.truthy());
@@ -356,6 +366,7 @@ pub fn looseCmp(a: Value, b: Value, mem: std.mem.Allocator) !std.math.Order {
 }
 
 pub fn looseEq(a: Value, b: Value, mem: std.mem.Allocator) !bool {
+    if (a == .int_ and b == .int_) return a.int_ == b.int_;
     return (try looseCmp(a, b, mem)) == .eq;
 }
 

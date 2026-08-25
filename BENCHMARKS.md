@@ -14,20 +14,21 @@ zig build -Doptimize=ReleaseFast
 bash scripts/bench.sh 5
 ```
 
-## Results (register bytecode VM, ReleaseFast)
+## Results (register bytecode VM + type fast paths, ReleaseFast)
 
 | workload | description | zphp (ms) | php (ms) | ratio |
 |---|---|---:|---:|---:|
-| fib | recursive fibonacci(27) — call overhead, branching | 125 | 96 | 1.3x |
-| loop | 30M iteration integer accumulation | 1334 | 494 | 2.7x |
-| arrays | 500k appends + foreach sum | 74 | 99 | **0.7x** |
-| strings | 100k `.` concatenations into a growing string | 1027 | 84 | 12.5x |
+| fib | recursive fibonacci(27) - call overhead, branching | 104 | 99 | **1.1x** |
+| loop | 30M iteration integer accumulation | 1072 | 491 | 2.2x |
+| arrays | 500k appends + foreach sum | 73 | 102 | **0.7x** |
+| strings | 100k `.` concatenations into a growing string | 1035 | 86 | 12.0x |
 
-The compiler is target-directed (`compileInto(dst, expr)`): expressions
-write straight into their destination register, so even "generic" code
-contains no operand-stack shuffling. Fused compare-and-branch instructions
-remain for loop conditions; the loop body is down to 4 dispatched
-instructions per iteration.
+Key optimizations beyond the ISA switch itself:
+- target-directed codegen: expressions write their destination register
+  directly; compound assigns read var operands in place (no temp+mov)
+- int/int fast paths bypass the loose-comparison machinery
+- call frames only null-init locals, not temporaries; arguments copy
+  directly between register files
 
 ## History
 
@@ -35,15 +36,16 @@ instructions per iteration.
 |---|---:|---:|---:|---:|
 | tree-walking interpreter | 1.7x | 7.8x | 1.5x | 11.9x |
 | stack bytecode VM (fused) | 1.1x | 2.6x | 0.8x | 12.0x |
-| **register bytecode VM** | 1.3x | **2.7x** | **0.7x** | 12.5x |
+| **register bytecode VM** | **1.1x** | **2.2x** | **0.7x** | 12.0x |
 
 (ratios vs PHP 8.5 + OPcache; lower is better)
 
 ## Notes
 
-- The remaining loop gap is dispatch overhead per instruction (~4 per
-  iteration vs PHP's tighter opcode stream). Further fusion or a register
-  bytecode would narrow it.
+- The remaining loop gap (~4 instructions/iteration vs PHP's ~3 specialized
+  opcodes) is dispatch overhead. Next lever: superinstruction for the whole
+  `local += local` + increment pattern, or a register allocator that keeps
+  loop counters pinned.
 - String workloads pay double: each `.` allocates a fresh arena string
   (O(n^2) total for repeated append), same asymptotics as PHP but without
   its internal optimizations (e.g. target-string reuse in CONCAT ops).

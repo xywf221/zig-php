@@ -852,12 +852,12 @@ pub const Compiler = struct {
                 switch (a.op) {
                     .assign => try self.compileInto(@intCast(slot), a.value),
                     .coalesce => {
-                        const tv = try self.exprToTemp(a.value);
+                        const tv = try self.exprToReg(a.value);
                         _ = try self.emit3(.coalesce, @intCast(slot), @intCast(slot), tv.reg, line);
                         tv.release(&self.ctx);
                     },
                     else => {
-                        const tv = try self.exprToTemp(a.value);
+                        const tv = try self.exprToReg(a.value);
                         _ = try self.emit3(binOpOf(compoundBinOp(a.op)), @intCast(slot), @intCast(slot), tv.reg, line);
                         tv.release(&self.ctx);
                     },
