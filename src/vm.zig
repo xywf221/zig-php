@@ -166,13 +166,15 @@ pub const Vm = struct {
         const lines = f.func.chunk.lines.items;
 
         while (true) {
+            // Single bounds check guards both code[] and lines[] (they are
+            // kept exactly parallel by Chunk.emit).
             if (f.ip >= code.len) {
                 // Implicit end of function body.
                 try self.popFrame(.null_);
                 return;
             }
             const ins = code[f.ip];
-            const line = lines[f.ip];
+            const line = lines[f.ip]; // bounds covered by the check above
             const regs = f.regs;
             f.ip += 1;
 

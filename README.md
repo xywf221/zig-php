@@ -20,8 +20,13 @@ $ zphp fib.php
 
 ## 特性
 
-- **字节码编译器 + 栈式虚拟机**（另附树遍历参考引擎，双引擎一致性测试）
-- 值系统：null / bool / int / float / string / array（有序字典语义）
+- **寄存器字节码编译器 + 虚拟机**（三地址码，Lua/Dalvik 风格）
+- 值系统：null / bool / int / float / string / array（有序字典 + 哈希索引）/
+  object（类、继承、属性、方法）/ 异常（Exception 类层次）
+- **面向对象子集**：class、extends、属性默认值、`__construct`、`$this`、
+  `->prop` / `->method()`、动态属性、`instanceof`、`get_class()`
+- **异常**：`throw` / `try` / 多子句 `catch (A|B $e)`，内置 Exception/Error
+  层次；除零抛出可捕获的 `DivisionByZeroError`
 - PHP 8 弱类型语义：truthiness、松散比较（含 PHP 8 的字符串-数字比较规则）、
   数值字符串前缀强制转换、数组键规范化（`"5"`→`5`、`true`→`1`…）
 - 完整控制流：`if/elseif/else`、`while`、`do-while`、`for`、`foreach`
@@ -30,17 +35,19 @@ $ zphp fib.php
 - 双引号字符串插值：`"$var"`、`$arr[0]`、`{$m["key"]}`
 - 运算符：算术、比较、逻辑（短路）、位运算、`??`、`?:`、`<=>`、`**`、
   复合赋值、前后置 `++/--`
-- 错误处理：解析/编译错误带行号报告；运行期 Fatal Error 对齐 PHP 行为
-- 标准库内置函数 45+：string（strlen/substr/sprintf/str_replace…）、
+- 错误处理：解析/编译错误带行号报告；运行期 Fatal Error 对齐 PHP 行为；
+  Warning 输出到 stderr（未定义变量、未定义数组键），stdout 保持纯净
+- 标准库内置函数 46+：string（strlen/substr/sprintf/str_replace…）、
   array（count/implode/explode/array_*…）、math（abs/max/pow…）、
   类型与检查（intval/gettype/is_*…）、输出（var_dump/print_r，格式与 PHP 逐字节一致）
+- 性能：fib 0.8x / loop 1.9x / arrays 1.0x / strings 0.4x（vs PHP 8.5 CLI，
+  三项反超或持平，详见 BENCHMARKS.md）
 
 ## 明确不支持（PHP 8.0+ 目标之外）
 
-- 面向对象（class/interface/trait）、引用（`&$var`）
+- 引用（`&$var`）、接口/trait/抽象类/静态成员、闭包/生成器/命名参数、heredoc
 - 旧语法：`array()` 字面量（用 `[...]`）、未定义常量降级为字符串（PHP 8 中本就是 Error）
-- 生成器、闭包、命名参数、属性注解、heredoc/nowdoc
-- 警告系统（undefined variable / non-numeric operand 静默处理，PHP 会发 Warning）
+- `finally` 子句（解析期明确报错）
 
 ## 构建
 
@@ -129,12 +136,16 @@ vm.zig             寄存器式字节码虚拟机：每帧平坦寄存器文件�
 
 ## 路线图
 
-- [x] 字节码编译 + 栈式 VM
+- [x] 字节码编译 + 寄存器 VM（三地址码，指令融合）
 - [x] 内置函数标准库（string/array/math/type/output）
-- [x] 指令融合（cmp-jmp / 复合赋值 / 自增丢弃变体）
+- [x] 哈希索引数组、rope 惰性拼接、调用帧池化
+- [x] OOP 子集（类/继承/构造器/属性/方法/instanceof）
+- [x] 异常：try/catch + Exception/Error 类层次
+- [x] 警告系统（stderr）
 - [ ] 引用语义 `&`
-- [ ] OOP 子集
-- [ ] 警告系统与 PHP 对齐的 float 科学计数法格式
+- [ ] 接口 / trait / 静态成员
+- [ ] NaN-boxing 值表示（收窄每指令固定成本，见 BENCHMARKS.md Notes）
+- [ ] 与 PHP 对齐的 float 科学计数法格式
 
 ## License
 
