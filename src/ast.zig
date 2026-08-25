@@ -136,10 +136,13 @@ pub const Expr = struct {
         method_call: struct { obj: *Expr, name: []const u8, args: []const *Expr },
         /// `expr instanceof ClassName`
         instanceof: struct { operand: *Expr, class_name: []const u8 },
+        /// `&$var` / `&$arr[key]` at a call-argument position: the argument is
+        /// passed by reference. Inner expression must be an lvalue.
+        ref_arg: *Expr,
     };
 
     pub const Elem = struct { key: ?*Expr, val: *Expr };
-    pub const Assign = struct { target: *Expr, op: AssignOp, value: *Expr };
+    pub const Assign = struct { target: *Expr, op: AssignOp, value: *Expr, by_ref: bool = false };
 
     pub fn isLvalue(self: *const Expr) bool {
         return switch (self.kind) {
@@ -204,6 +207,8 @@ pub const Stmt = struct {
         /// Parameter name without '$'.
         name: []const u8,
         default: ?*Expr,
+        /// `&$x` — by-reference parameter.
+        by_ref: bool = false,
     };
 
     pub const PropDecl = struct {

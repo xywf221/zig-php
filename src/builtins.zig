@@ -653,7 +653,7 @@ fn fn_is_numeric(in: *Vm, args: []const Value) Error!Value {
 fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "gettype($value)");
     // PHP keeps the historical names.
-    const name: []const u8 = switch (args[0]) {
+    const name: []const u8 = switch (args[0].resolveDeep()) {
         .null_ => "NULL",
         .bool_ => "boolean",
         .int_ => "integer",
@@ -661,6 +661,7 @@ fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
         .str_, .rope_ => "string",
         .array_ => "array",
         .obj_ => "object",
+        .ref_ => "reference",
     };
     return try mkStr(in, name);
 }
@@ -670,7 +671,7 @@ fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
 fn dumpValue(in: *Vm, v: Value, indent: u32) Error!void {
     var pad_buf: [128]u8 = .{' '} ** 128;
     const pad = pad_buf[0 .. indent * 2];
-    switch (v) {
+    switch (v.resolveDeep()) {
         .null_ => try in.out.print("{s}NULL\n", .{pad}),
         .bool_ => |b| try in.out.print("{s}bool({s})\n", .{ pad, if (b) "true" else "false" }),
         .int_ => |i| try in.out.print("{s}int({d})\n", .{ pad, i }),
@@ -687,6 +688,7 @@ fn dumpValue(in: *Vm, v: Value, indent: u32) Error!void {
             }
             try in.out.print("{s}}}\n", .{pad});
         },
+        .ref_ => unreachable, // resolveDeep above
         .array_ => {
             const arr = v.array_;
             try in.out.print("{s}array({d}) {{\n", .{ pad, arr.count() });

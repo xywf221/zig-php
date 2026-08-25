@@ -70,5 +70,7 @@ pub const Func = struct {
     nhidden: usize = 0,
     /// Constant default parameter values; null entry = required parameter.
     defaults: []?Value = &.{},
+    /// Which parameters are `&by-reference`.
+    by_ref_params: []const bool = &.{},
     chunk: Chunk = .{},
 };

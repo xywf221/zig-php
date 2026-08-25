@@ -17,6 +17,13 @@ pub const StrVal = struct {
     data: []const u8,
 };
 
+/// Shared variable container for PHP references (`&`). Multiple names
+/// (variable slots, array elements, object properties) can point at the
+/// same Cell; writes through any alias are visible to all.
+pub const Cell = struct {
+    val: Value,
+};
+
 /// Allocate a string header wrapping `slice` (zero-copy view).
 pub fn newStr(a: std.mem.Allocator, slice: []const u8) !*StrVal {
     const s = try a.create(StrVal);
@@ -136,6 +143,8 @@ pub const Value = union(enum) {
     float_: f64,
     /// Boxed string header (keeps Value at 16 bytes, Zend-zval style).
     str_: *StrVal,
+    /// PHP reference: shared container.
+    ref_: *Cell,
     /// Lazily concatenated string produced by `.` / `.=`. Materializes
     /// (O(total length)) the first time raw bytes are needed.
     rope_: *const Rope,
@@ -229,10 +238,28 @@ pub const Value = union(enum) {
             .str_, .rope_ => "string",
             .array_ => "array",
             .obj_ => "object",
+            .ref_ => "reference",
         };
     }
 
+    /// Resolve one level of PHP reference.
+    pub fn resolve(self: Value) Value {
+        return if (self == .ref_) self.ref_.val else self;
+    }
+
+    /// Resolve recursively (references never nest in practice, but stay safe).
+    pub fn resolveDeep(self: Value) Value {
+        var v = self;
+        var guard: u8 = 0;
+        while (v == .ref_ and guard < 8) : (guard += 1) v = v.ref_.val;
+        return v;
+    }
+
     pub fn truthy(self: Value) bool {
+        return self.resolveDeep().truthyInner();
+    }
+
+    fn truthyInner(self: Value) bool {
         return switch (self) {
             .null_ => false,
             .bool_ => |b| b,
@@ -243,6 +270,7 @@ pub const Value = union(enum) {
             .rope_ => |r| r.len > 0 and !(r.len == 1 and firstByte(r) == '0'),
             .array_ => |arr| arr.count() > 0,
             .obj_ => true,
+            .ref_ => unreachable, // resolved by truthy()
         };
     }
 
@@ -257,7 +285,8 @@ pub const Value = union(enum) {
 
 
 /// Convert any value to its PHP string representation.
-pub fn toString(v: Value, a: std.mem.Allocator) ![]const u8 {
+pub fn toString(v0: Value, a: std.mem.Allocator) ![]const u8 {
+    const v = v0.resolveDeep();
     return switch (v) {
         .null_ => "",
         .bool_ => |b| if (b) "1" else "",
@@ -269,6 +298,7 @@ pub fn toString(v: Value, a: std.mem.Allocator) ![]const u8 {
         // Callers that need PHP's fatal-object-conversion semantics must
         // reject objects before calling; this fallback keeps toString total.
         .obj_ => "Object",
+        .ref_ => unreachable, // resolved above
     };
 }
 
@@ -403,7 +433,8 @@ pub fn fmtFloat(f: f64, a: std.mem.Allocator) error{OutOfMemory}![]const u8 {
 /// Normalize a value into an array key following PHP rules:
 /// int stays, bool -> 0/1, float -> truncate, null -> "", numeric strings
 /// become ints, everything else keeps its string form.
-pub fn makeKey(v: Value, a: std.mem.Allocator) !Key {
+pub fn makeKey(v0: Value, a: std.mem.Allocator) !Key {
+    const v = v0.resolveDeep();
     return switch (v) {
         .null_ => .{ .str = "" },
         .bool_ => |b| .{ .int = @intFromBool(b) },
@@ -414,7 +445,7 @@ pub fn makeKey(v: Value, a: std.mem.Allocator) !Key {
             break :blk Key{ .str = s.data };
         },
         .rope_ => |r| try makeKey(.{ .str_ = try newStr(a, try r.flatten(a)) }, a),
-        .array_, .obj_ => fatalKey(),
+        .array_, .obj_, .ref_ => fatalKey(),
     };
 }
 
@@ -521,7 +552,8 @@ pub fn leadingNumber(s: []const u8) Number {
 }
 
 /// Coerce any scalar to a number for arithmetic operations.
-pub fn toNumber(v: Value, mem: std.mem.Allocator) Number {
+pub fn toNumber(v0: Value, mem: std.mem.Allocator) Number {
+    const v = v0.resolveDeep();
     return switch (v) {
         .null_ => .{ .int = 0 },
         .bool_ => |b| .{ .int = @intFromBool(b) },
@@ -533,6 +565,7 @@ pub fn toNumber(v: Value, mem: std.mem.Allocator) Number {
             break :blk leadingNumber(s);
         },
         .array_, .obj_ => .{ .int = 0 }, // callers must reject arrays/objects beforehand
+        .ref_ => unreachable,
     };
 }
 
@@ -559,9 +592,9 @@ fn strcmpOrder(a: []const u8, b: []const u8) std.math.Order {
 /// Loose comparison (`<`, `>`, `==`) approximating PHP 8 semantics.
 pub fn looseCmp(a_in: Value, b_in: Value, mem: std.mem.Allocator) !std.math.Order {
     // Materialize strings/ropes once; the rest of the machinery works on
-    // plain slices.
-    var a = a_in;
-    var b = b_in;
+    // plain slices. References resolve first (PHP compares referents).
+    var a = a_in.resolveDeep();
+    var b = b_in.resolveDeep();
     var a_str: []const u8 = "";
     var b_str: []const u8 = "";
     if (a == .str_) a_str = a.str_.data;
@@ -665,8 +698,8 @@ pub fn looseEq(a: Value, b: Value, mem: std.mem.Allocator) std.mem.Allocator.Err
 
 /// Strict equality (`===`). Arrays compare deeply and order-sensitively.
 pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) std.mem.Allocator.Error!bool {
-    var a = a_in;
-    var b = b_in;
+    var a = a_in.resolveDeep();
+    var b = b_in.resolveDeep();
     // Ropes are an internal representation; compare as strings.
     // NOTE: must not write `a = .{...toString(a)...}` in one statement:
     // result-location semantics construct the new union in place, clobbering

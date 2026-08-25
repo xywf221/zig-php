@@ -39,7 +39,7 @@ fn dumpFn(out: *std.Io.Writer, name: []const u8, f: anytype) !void {
     }
     for (f.chunk.consts.items, 0..) |c, i| {
         switch (c) {
-            .str_ => |st| try out.print("const[{d}] = \"{s}\"\n", .{ i, st }),
+            .str_ => |st| try out.print("const[{d}] = \"{s}\"\n", .{ i, st.data }),
             else => try out.print("const[{d}] = {any}\n", .{ i, c }),
         }
     }

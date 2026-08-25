@@ -70,6 +70,9 @@ pub const Compiler = struct {
         locals: std.StringHashMapUnmanaged(usize) = .empty,
         /// Slots proven assigned before a read (flow-insensitive).
         defined: std.AutoHashMapUnmanaged(usize, void) = .empty,
+        /// Slots that participate in PHP references (`=&`, by-ref params).
+        /// Accesses to these are rewritten to ld_ref/st_ref.
+        ref_slots: std.AutoHashMapUnmanaged(usize, void) = .empty,
         next_temp: u32 = 0,
         free_list: std.ArrayList(u32) = .empty,
         nhidden: u32 = 0,
@@ -145,6 +148,8 @@ pub const Compiler = struct {
     ctx: *FnCtx,
     chunk: *Chunk,
     loops: std.ArrayList(*LoopCtx) = .empty,
+    /// For compile-time callee lookup (by-ref argument promotion).
+    program: *Program,
 
     // -- entry points ------------------------------------------------------------
 
@@ -194,6 +199,28 @@ pub const Compiler = struct {
     fn reserveLocalsExpr(arena: std.mem.Allocator, e: *ast.Expr, ctx: *FnCtx) Error!void {
         switch (e.kind) {
             .var_ref => |name| _ = try ctx.resolveLocal(arena, name),
+            .ref_arg => |inner| {
+                try reserveLocalsExpr(arena, inner, ctx);
+                if (inner.kind == .var_ref) {
+                    const slot = try ctx.resolveLocal(arena, inner.kind.var_ref);
+                    try ctx.ref_slots.put(arena, slot, {});
+                }
+            },
+            .assign => |a| {
+                if (a.by_ref) {
+                    // Both sides of `=&` share a container.
+                    if (a.target.kind == .var_ref) {
+                        const tslot = try ctx.resolveLocal(arena, a.target.kind.var_ref);
+                        try ctx.ref_slots.put(arena, tslot, {});
+                    }
+                    if (a.value.kind == .var_ref) {
+                        const vslot = try ctx.resolveLocal(arena, a.value.kind.var_ref);
+                        try ctx.ref_slots.put(arena, vslot, {});
+                    }
+                }
+                try reserveLocalsExpr(arena, a.target, ctx);
+                try reserveLocalsExpr(arena, a.value, ctx);
+            },
             .interp_str => |parts| {
                 for (parts) |part| {
                     switch (part) {
@@ -219,10 +246,6 @@ pub const Compiler = struct {
                 if (tn.then) |t| try reserveLocalsExpr(arena, t, ctx);
                 try reserveLocalsExpr(arena, tn.els, ctx);
             },
-            .assign => |a| {
-                try reserveLocalsExpr(arena, a.target, ctx);
-                try reserveLocalsExpr(arena, a.value, ctx);
-            },
             .inc_dec => |d| try reserveLocalsExpr(arena, d.target, ctx),
             .call => |c| {
                 for (c.args) |arg| try reserveLocalsExpr(arena, arg, ctx);
@@ -246,20 +269,23 @@ pub const Compiler = struct {
 
     pub fn compile(arena: std.mem.Allocator, prog_ast: []const *ast.Stmt, diag: *Diag) Error!*Program {
         const program = try arena.create(Program);
+        program.* = .{ .main_func = undefined };
 
         const main_func = try arena.create(Func);
         main_func.* = .{ .name = "<main>", .arity = 0 };
+        // Collect functions/classes FIRST so codegen can resolve callees
+        // (needed for by-reference argument promotion).
+        try collectFuncs(arena, prog_ast, program, diag);
+
         var main_ctx = FnCtx{ .func = main_func, .arena = arena };
         try reserveLocals(arena, prog_ast, &main_ctx);
         main_ctx.next_temp = @intCast(main_func.nlocals);
         {
-            var c = Compiler{ .arena = arena, .diag = diag, .ctx = &main_ctx, .chunk = &main_func.chunk };
+            var c = Compiler{ .arena = arena, .diag = diag, .ctx = &main_ctx, .chunk = &main_func.chunk, .program = program };
             try c.compileStmts(prog_ast);
             _ = try c.emit(.return_null, 0);
         }
-        program.* = .{ .main_func = main_func };
-
-        try collectFuncs(arena, prog_ast, program, diag);
+        program.main_func = main_func;
         return program;
     }
 
@@ -279,14 +305,14 @@ pub const Compiler = struct {
         switch (st.kind) {
             .class_decl => |cd| {
                 if (!program.classes.contains(cd.name)) { // first wins
-                    const info = try compileClassUnit(arena, cd, diag);
+                    const info = try compileClassUnit(arena, cd, diag, program);
                     try program.classes.put(arena, cd.name, info);
                 }
                 if (hoist) try program.hoisted_classes.put(arena, cd.name, {});
             },
             .func_decl => |fd| {
                 if (!program.funcs.contains(fd.name)) { // first wins
-                    const f = try compileFuncUnit(arena, fd, diag, false);
+                    const f = try compileFuncUnit(arena, fd, diag, false, program);
                     try program.funcs.put(arena, fd.name, f);
                 }
                 if (hoist) try program.hoisted.put(arena, fd.name, {});
@@ -305,7 +331,7 @@ pub const Compiler = struct {
         }
     }
 
-    fn compileClassUnit(arena: std.mem.Allocator, cd: ast.Stmt.ClassDecl, diag: *Diag) Error!*ClassInfo {
+    fn compileClassUnit(arena: std.mem.Allocator, cd: ast.Stmt.ClassDecl, diag: *Diag, program: *Program) Error!*ClassInfo {
         const info = try arena.create(ClassInfo);
         info.* = .{ .name = cd.name, .parent_name = cd.extends };
         const props = try arena.alloc(ClassProp, cd.props.len);
@@ -315,13 +341,13 @@ pub const Compiler = struct {
         info.own_props = props;
         for (cd.methods) |m| {
             if (info.methods.contains(m.name)) continue; // first wins
-            const f = try compileFuncUnit(arena, m, diag, true);
+            const f = try compileFuncUnit(arena, m, diag, true, program);
             try info.methods.put(arena, m.name, f);
         }
         return info;
     }
 
-    fn compileFuncUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag, implicit_this: bool) Error!*Func {
+    fn compileFuncUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag, implicit_this: bool, program: *Program) Error!*Func {
         const f = try arena.create(Func);
         f.* = .{
             .name = fd.name,
@@ -348,13 +374,17 @@ pub const Compiler = struct {
             const tslot = try ctx.resolveLocal(arena, "this");
             ctx.markDefined(tslot);
         }
-        for (fd.params) |p| {
+        var by_ref_params = try arena.alloc(bool, fd.params.len);
+        for (fd.params, 0..) |p, pi| {
             const pslot = try ctx.resolveLocal(arena, p.name);
             ctx.markDefined(pslot); // parameters are always defined
+            by_ref_params[pi] = p.by_ref;
+            if (p.by_ref) try ctx.ref_slots.put(arena, pslot, {});
         }
+        f.by_ref_params = by_ref_params;
         try reserveLocals(arena, fd.body, &ctx);
         ctx.next_temp = @intCast(f.nlocals);
-        var c = Compiler{ .arena = arena, .diag = diag, .ctx = &ctx, .chunk = &f.chunk };
+        var c = Compiler{ .arena = arena, .diag = diag, .ctx = &ctx, .chunk = &f.chunk, .program = program };
         try c.compileStmts(fd.body);
         _ = try c.emit(.return_null, 0);
         return f;
@@ -725,6 +755,12 @@ pub const Compiler = struct {
             const name = e.kind.var_ref;
             const slot = try self.ctx.resolveLocal(self.arena, name);
             try self.checkDefined(slot, name, line);
+            // Reference slots must be dereferenced into a temp.
+            if (self.ctx.ref_slots.contains(slot)) {
+                const tmp = self.ctx.alloc();
+                _ = try self.emit2(.ld_ref, tmp, @intCast(slot), line);
+                return .{ .reg = tmp, .owned = true };
+            }
             return .{ .reg = @intCast(slot), .owned = false };
         }
         return self.exprToTemp(e);
@@ -822,7 +858,11 @@ pub const Compiler = struct {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
                 try self.checkDefined(slot, name, line);
-                if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
+                if (self.ctx.ref_slots.contains(slot)) {
+                    _ = try self.emit2(.ld_ref, dst, @intCast(slot), line);
+                } else if (dst != slot) {
+                    _ = try self.emit2(.mov, dst, @intCast(slot), line);
+                }
             },
 
             .interp_str => |parts| {
@@ -844,12 +884,20 @@ pub const Compiler = struct {
                         .var_ref => |name| {
                             const slot = try self.ctx.resolveLocal(self.arena, name);
                             try self.checkDefined(slot, name, line);
-                            _ = try self.emit2(.mov, r, @intCast(slot), line);
+                            if (self.ctx.ref_slots.contains(slot)) {
+                                _ = try self.emit2(.ld_ref, r, @intCast(slot), line);
+                            } else {
+                                _ = try self.emit2(.mov, r, @intCast(slot), line);
+                            }
                         },
                         .var_index => |vi| {
                             const slot = try self.ctx.resolveLocal(self.arena, vi.name);
                             try self.checkDefined(slot, vi.name, line);
-                            _ = try self.emit2(.mov, r, @intCast(slot), line);
+                            if (self.ctx.ref_slots.contains(slot)) {
+                                _ = try self.emit2(.ld_ref, r, @intCast(slot), line);
+                            } else {
+                                _ = try self.emit2(.mov, r, @intCast(slot), line);
+                            }
                             for (vi.keys) |key| {
                                 const tk = self.ctx.alloc();
                                 switch (key) {
@@ -936,8 +984,39 @@ pub const Compiler = struct {
                 // exists even for zero-argument calls.
                 const n = @max(c.args.len, 1);
                 const base = self.ctx.allocBlock(n);
+                // Resolve the callee at compile time to learn by-ref params.
+                const callee: ?*Func = self.program.funcs.get(c.name);
                 for (c.args, 0..) |ae, i| {
-                    try self.compileInto(base + @as(u32, @intCast(i)), ae);
+                    const arg_dst = base + @as(u32, @intCast(i));
+                    if (ae.kind == .ref_arg) {
+                        try self.compileInto(arg_dst, ae);
+                        continue;
+                    }
+                    if (callee) |cf| {
+                        // By-ref parameter with an lvalue argument?
+                        if (i < cf.by_ref_params.len and cf.by_ref_params[i]) {
+                            switch (ae.kind) {
+                                .var_ref => |vn| {
+                                    const vslot = try self.ctx.resolveLocal(self.arena, vn);
+                                    try self.checkDefined(vslot, vn, line);
+                                    try self.ctx.ref_slots.put(self.arena, vslot, {});
+                                    _ = try self.emit2(.make_ref_cell, arg_dst, @intCast(vslot), line);
+                                    continue;
+                                },
+                                .index => |ix| {
+                                    const tb = try self.exprToReg(ix.base, line);
+                                    const tk = try self.exprToTemp(ix.index orelse
+                                        return self.fail(line, "cannot reference-append", .{}));
+                                    _ = try self.emit3(.elem_cell, arg_dst, tb.reg, tk.reg, line);
+                                    tk.release(&self.ctx);
+                                    tb.release(&self.ctx);
+                                    continue;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    try self.compileInto(arg_dst, ae);
                 }
                 const k = try self.nameConst(c.name);
                 _ = try self.emit3(.call, @intCast(c.args.len), base, k, line);
@@ -997,6 +1076,26 @@ pub const Compiler = struct {
                 t.release(&self.ctx);
             },
 
+            .ref_arg => |inner| {
+                // By-reference argument: materialize the lvalue's container.
+                switch (inner.kind) {
+                    .var_ref => |name| {
+                        const slot = try self.ctx.resolveLocal(self.arena, name);
+                        try self.checkDefined(slot, name, line);
+                        _ = try self.emit2(.make_ref_cell, dst, @intCast(slot), line);
+                    },
+                    .index => |ix| {
+                        const tb = try self.exprToReg(ix.base, line);
+                        const tk = try self.exprToTemp(ix.index orelse
+                            return self.fail(line, "cannot reference-append", .{}));
+                        _ = try self.emit3(.elem_cell, dst, tb.reg, tk.reg, line);
+                        tk.release(&self.ctx);
+                        tb.release(&self.ctx);
+                    },
+                    else => return self.fail(line, "only variables can be passed by reference", .{}),
+                }
+            },
+
             .isset => |exprs| {
                 try self.compileIssetOne(dst, exprs[0], line);
                 for (exprs[1..]) |x| {
@@ -1044,7 +1143,12 @@ pub const Compiler = struct {
         switch (base.kind) {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
-                _ = try self.emit2(.vivify_local, dst, @intCast(slot), line);
+                if (self.ctx.ref_slots.contains(slot)) {
+                    // Reference to the container: deref first.
+                    _ = try self.emit2(.ld_ref, dst, @intCast(slot), line);
+                } else {
+                    _ = try self.emit2(.vivify_local, dst, @intCast(slot), line);
+                }
             },
             .index => |ix| {
                 const parent = self.ctx.alloc();
@@ -1065,6 +1169,61 @@ pub const Compiler = struct {
         switch (a.target.kind) {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
+                const is_ref = self.ctx.ref_slots.contains(slot);
+
+                // `$lhs =& $rhs` — share containers.
+                if (a.by_ref and a.op == .assign) {
+                    switch (a.value.kind) {
+                        .var_ref => {
+                            const rslot = try self.ctx.resolveLocal(self.arena, a.value.kind.var_ref);
+                            try self.checkDefined(rslot, a.value.kind.var_ref, line);
+                            // Promote the source slot and copy its cell into
+                            // the target slot.
+                            _ = try self.emit2(.make_ref_cell, @intCast(rslot), @intCast(rslot), line);
+                            _ = try self.emit2(.bind_ref, @intCast(slot), @intCast(rslot), line);
+                        },
+                        else => return self.fail(line, "=& expects a variable on the right-hand side", .{}),
+                    }
+                    self.ctx.markDefined(slot);
+                    if (dst != slot) _ = try self.emit2(.mov, dst, @intCast(slot), line);
+                    return;
+                }
+
+                if (is_ref) {
+                    // Dereferenced read-modify-write through the shared cell.
+                    switch (a.op) {
+                        .assign => {
+                            const tv = try self.exprToTemp(a.value);
+                            _ = try self.emit2(.st_ref, @intCast(slot), @intCast(tv.reg), line);
+                            tv.release(&self.ctx);
+                        },
+                        .coalesce => {
+                            const told = self.ctx.alloc();
+                            _ = try self.emit2(.ld_ref, told, @intCast(slot), line);
+                            const tv = try self.exprToTemp(a.value);
+                            _ = try self.emit3(.coalesce, told, told, tv.reg, line);
+                            _ = try self.emit2(.st_ref, @intCast(slot), told, line);
+                            self.ctx.freeReg(tv.reg);
+                            self.ctx.freeReg(told);
+                        },
+                        else => {
+                            try self.checkDefined(slot, name, line);
+                            const told = self.ctx.alloc();
+                            _ = try self.emit2(.ld_ref, told, @intCast(slot), line);
+                            const tv = try self.exprToTemp(a.value);
+                            _ = try self.emit3(binOpOf(compoundBinOp(a.op)), tv.reg, told, tv.reg, line);
+                            _ = try self.emit2(.st_ref, @intCast(slot), tv.reg, line);
+                            self.ctx.freeReg(tv.reg);
+                            self.ctx.freeReg(told);
+                        },
+                    }
+                    self.ctx.markDefined(slot);
+                    if (dst != slot) {
+                        _ = try self.emit2(.ld_ref, dst, @intCast(slot), line);
+                    }
+                    return;
+                }
+
                 switch (a.op) {
                     .assign => {
                         try self.compileInto(@intCast(slot), a.value);
@@ -1172,7 +1331,27 @@ pub const Compiler = struct {
             .var_ref => |name| {
                 const slot = try self.ctx.resolveLocal(self.arena, name);
                 try self.checkDefined(slot, name, line);
-                if (postfix) {
+                if (self.ctx.ref_slots.contains(slot)) {
+                    // ld_ref / inc / st_ref sequence.
+                    const told = self.ctx.alloc();
+                    _ = try self.emit2(.ld_ref, told, @intCast(slot), line);
+                    if (postfix) {
+                        const told_old = self.ctx.alloc();
+                        _ = try self.emit2(.mov, told_old, told, line);
+                        _ = try self.emit1(if (up) .inc_l else .dec_l, told, line);
+                        _ = try self.emit2(.st_ref, @intCast(slot), told, line);
+                        // Result register may BE the slot (statement fusion);
+                        // never overwrite it with a raw value.
+                        if (dst != slot) _ = try self.emit2(.mov, dst, told_old, line);
+                        self.ctx.freeReg(told_old);
+                    } else {
+                        _ = try self.emit1(if (up) .inc_l else .dec_l, told, line);
+                        _ = try self.emit2(.st_ref, @intCast(slot), told, line);
+                        if (dst != slot) _ = try self.emit2(.mov, dst, told, line);
+                    }
+                    self.ctx.freeReg(told);
+                    self.ctx.markDefined(slot);
+                } else if (postfix) {
                     // dst = old; slot = old +/- 1
                     const op: Op = if (up) .post_inc_l else .post_dec_l;
                     _ = try self.emit2(op, dst, @intCast(slot), line);

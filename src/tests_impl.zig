@@ -275,6 +275,28 @@ test "non-numeric strings throw a catchable TypeError" {
 }
 
 // ===========================================================================
+// References
+// ===========================================================================
+
+test "reference binding: writes propagate both ways" {
+    try expectOut("$a = 5; $b =& $a; $b = 7; echo $a;", "7");
+    try expectOut("$a = 5; $b =& $a; $a = 9; echo $b;", "9");
+}
+
+test "reference increment and compound assign" {
+    try expectOut("$a = 1; $b =& $a; $b++; $c =& $a; $c += 10; echo $a, $b, $c;", "121212");
+}
+
+test "by-reference parameters" {
+    try expectOut("function f(&$x) { $x *= 2; } $v = 21; f($v); echo $v;", "42");
+    try expectOut("$arr = [1, 2]; function set(&$e) { $e = 99; } set($arr[0]); echo $arr[0], $arr[1];", "992");
+}
+
+test "array aliasing through reference" {
+    try expectOut("$a = [1]; $r =& $a; $r[0] = 100; echo $a[0], count($a);", "1001");
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 

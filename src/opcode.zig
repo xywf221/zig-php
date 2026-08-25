@@ -106,6 +106,18 @@ pub const Op = enum(u8) {
     /// re-throw the pending exception (no clause matched)
     rethrow,
 
+    // -- references ------------------------------------------------------------------
+    /// a = deref(regs[b])
+    ld_ref,
+    /// write regs[b] through regs[a]'s cell (a must hold .ref_)
+    st_ref,
+    /// promote slot b to a shared Cell; a = that cell (.ref_)
+    make_ref_cell,
+    /// regs[a] = the .ref_ cell in regs[b]
+    bind_ref,
+    /// a = get-or-create shared Cell for regs[b][regs[c]] (array element)
+    elem_cell,
+
     // -- strings / output ----------------------------------------------------------------------
     strconcat, // a = join(regs[b] .. regs[b+c-1]) stringified
     echo, // print regs[a] .. regs[a+b-1]

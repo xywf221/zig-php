@@ -283,10 +283,11 @@ pub const Parser = struct {
         var params: std.ArrayList(ast.Stmt.Param) = .empty;
         if (!self.check(.rparen)) {
             while (true) {
+                const by_ref = self.accept(.amp);
                 const p = try self.expect(.variable);
                 var default_val: ?*ast.Expr = null;
                 if (self.accept(.assign)) default_val = try self.parseExpr();
-                try params.append(self.arena, .{ .name = p.text[1..], .default = default_val });
+                try params.append(self.arena, .{ .name = p.text[1..], .default = default_val, .by_ref = by_ref });
                 if (!self.accept(.comma)) break;
             }
         }
@@ -310,6 +311,24 @@ pub const Parser = struct {
     }
 
     /// Parse a comma-separated expression list terminated by `end`.
+    /// Call arguments may be `&$var` (by-reference).
+    fn parseCallArgs(self: *Parser, end: Kind) Error![]const *ast.Expr {
+        var list: std.ArrayList(*ast.Expr) = .empty;
+        if (!self.check(end)) {
+            while (true) {
+                if (self.check(.amp) and self.toks[self.i + 1].kind == .variable) {
+                    const line = self.advance().line;
+                    const inner = try self.parseUnary(); // parses $var (and subscripts)
+                    try list.append(self.arena, try self.expr(.{ .ref_arg = inner }, line));
+                } else {
+                    try list.append(self.arena, try self.parseExpr());
+                }
+                if (!self.accept(.comma)) break;
+            }
+        }
+        return list.toOwnedSlice(self.arena);
+    }
+
     fn parseExprList(self: *Parser, end: Kind) Error![]const *ast.Expr {
         var list: std.ArrayList(*ast.Expr) = .empty;
         if (!self.check(end)) {
@@ -353,11 +372,15 @@ pub const Parser = struct {
                 return self.fail("cannot assign to this expression", .{});
             }
             const line = self.advance().line;
+            // `$x =& $y` / `$x = &$y`: reference binding.
+            var by_ref = false;
+            if (op == .assign and self.accept(.amp)) by_ref = true;
             const value = try self.parseAssign(); // right-associative
             return self.expr(.{ .assign = .{
                 .target = left,
                 .op = op,
                 .value = value,
+                .by_ref = by_ref,
             } }, line);
         }
         return left;
@@ -608,7 +631,7 @@ pub const Parser = struct {
                         else => return self.fail("syntax error, unexpected '('", .{}),
                     };
                     _ = self.advance();
-                    const args = try self.parseExprList(.rparen);
+                    const args = try self.parseCallArgs(.rparen);
                     _ = try self.expect(.rparen);
                     e = try self.expr(.{ .call = .{ .name = name, .args = args } }, line);
                 },
@@ -617,7 +640,7 @@ pub const Parser = struct {
                     const name_tok = try self.expect(.ident);
                     if (self.check(.lparen)) {
                         _ = self.advance();
-                        const args = if (self.check(.rparen)) try self.arena.alloc(*ast.Expr, 0) else try self.parseExprList(.rparen);
+                        const args = if (self.check(.rparen)) try self.arena.alloc(*ast.Expr, 0) else try self.parseCallArgs(.rparen);
                         _ = try self.expect(.rparen);
                         e = try self.expr(.{ .method_call = .{ .obj = e, .name = name_tok.text, .args = args } }, line);
                     } else {

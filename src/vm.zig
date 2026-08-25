@@ -201,10 +201,18 @@ pub const Vm = struct {
                 .set_index => {
                     const arr = try self.wantArray(regs[ins.a], line);
                     if (regs[ins.b] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
-                    try arr.set(self.arena, try valmod.makeKey(regs[ins.b], self.arena), regs[ins.c]);
+                    const skey = try valmod.makeKey(regs[ins.b], self.arena);
+                    // Write through reference cells (PHP element aliases).
+                    if (arr.get(skey)) |existing| {
+                        if (existing == .ref_) {
+                            existing.ref_.val = regs[ins.c];
+                            continue;
+                        }
+                    }
+                    try arr.set(self.arena, skey, regs[ins.c]);
                 },
                 .get_index => {
-                    regs[ins.a] = try self.indexRead(regs[ins.b], regs[ins.c], line);
+                    regs[ins.a] = (try self.indexRead(regs[ins.b], regs[ins.c], line)).resolveDeep();
                 },
                 .isset_index => {
                     const container = regs[ins.b];
@@ -365,15 +373,23 @@ pub const Vm = struct {
                     const o = regs[ins.b];
                     if (o != .obj_) return self.fatalF(line, "attempt to read property on {s}", .{o.typeName()});
                     const name = consts[ins.c].str_.data;
-                    regs[ins.a] = o.obj_.get(name) orelse blk: {
+                    const got: Value = o.obj_.get(name) orelse blk: {
                         self.warn(line, "Undefined property: {s}::${s}", .{ o.obj_.class_name, name });
                         break :blk .null_;
                     };
+                    regs[ins.a] = got.resolveDeep();
                 },
                 .set_prop => {
                     const o = regs[ins.a];
                     if (o != .obj_) return self.fatalF(line, "attempt to assign property on {s}", .{o.typeName()});
-                    try o.obj_.set(self.arena, consts[ins.b].str_.data, regs[ins.c]);
+                    const pname = consts[ins.b].str_.data;
+                    if (o.obj_.get(pname)) |existing| {
+                        if (existing == .ref_) {
+                            existing.ref_.val = regs[ins.c];
+                            continue;
+                        }
+                    }
+                    try o.obj_.set(self.arena, pname, regs[ins.c]);
                 },
                 .call_method => {
                     const obj_val = f.regs[ins.b];
@@ -444,6 +460,45 @@ pub const Vm = struct {
                     }
                     self.pending_ex = v.obj_;
                     try self.throwInCurrentFrame(f);
+                },
+                .bind_ref => {
+                    const cell = regs[ins.b];
+                    if (cell != .ref_) return self.fatalF(line, "internal: bind_ref source is not a reference", .{});
+                    regs[ins.a] = cell;
+                },
+                .ld_ref => {
+                    regs[ins.a] = regs[ins.b].resolveDeep();
+                },
+                .st_ref => {
+                    const cur = regs[ins.a];
+                    if (cur == .ref_) cur.ref_.val = regs[ins.b] else regs[ins.a] = regs[ins.b];
+                },
+                .make_ref_cell => {
+                    if (regs[ins.b] == .ref_) {
+                        regs[ins.a] = regs[ins.b];
+                    } else {
+                        const cell = try self.arena.create(valmod.Cell);
+                        cell.* = .{ .val = regs[ins.b] };
+                        const boxed: Value = .{ .ref_ = cell };
+                        regs[ins.b] = boxed;
+                        regs[ins.a] = boxed;
+                    }
+                },
+                .elem_cell => {
+                    const arr = try self.wantArray(regs[ins.b], line);
+                    if (regs[ins.c] == .array_) return self.fatalF(line, "illegal offset type: array", .{});
+                    const key = try valmod.makeKey(regs[ins.c], self.arena);
+                    if (arr.get(key)) |existing| {
+                        if (existing == .ref_) {
+                            regs[ins.a] = existing;
+                            continue;
+                        }
+                    }
+                    const cur = arr.get(key) orelse .null_;
+                    const cell = try self.arena.create(valmod.Cell);
+                    cell.* = .{ .val = cur };
+                    try arr.set(self.arena, key, .{ .ref_ = cell });
+                    regs[ins.a] = .{ .ref_ = cell };
                 },
                 .rethrow => {
                     if (self.pending_ex == null) return self.fatalF(line, "internal: rethrow without pending exception", .{});
@@ -570,7 +625,7 @@ pub const Vm = struct {
                     } else if (!has_key and ins.a != opcode.no_reg) {
                         return self.fatalF(line, "internal: unexpected key binding", .{});
                     }
-                    regs[ins.b] = entry.val;
+                    if (regs[ins.b] == .ref_) regs[ins.b].ref_.val = entry.val else regs[ins.b] = entry.val;
                     continue;
                 },
 
