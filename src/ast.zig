@@ -134,6 +134,12 @@ pub const Expr = struct {
         prop_get: struct { obj: *Expr, name: []const u8 },
         /// `$obj->method(args)`
         method_call: struct { obj: *Expr, name: []const u8, args: []const *Expr },
+        /// `Cls::$prop` / `self::$prop` — cls is "ClassName"/"self"/"parent"/"static".
+        static_get: struct { cls: []const u8, name: []const u8 },
+        /// `Cls::$prop = v` assignment target
+        static_set: struct { cls: []const u8, name: []const u8, value: *Expr },
+        /// `Cls::method(args)` — no instance.
+        static_call: struct { cls: []const u8, name: []const u8, args: []const *Expr },
         /// `expr instanceof ClassName`
         instanceof: struct { operand: *Expr, class_name: []const u8 },
         /// `&$var` / `&$arr[key]` at a call-argument position: the argument is
@@ -146,7 +152,7 @@ pub const Expr = struct {
 
     pub fn isLvalue(self: *const Expr) bool {
         return switch (self.kind) {
-            .var_ref, .index, .prop_get => true,
+            .var_ref, .index, .prop_get, .static_get => true,
             else => false,
         };
     }
@@ -201,6 +207,8 @@ pub const Stmt = struct {
         name: []const u8,
         params: []const Param,
         body: []const *Stmt,
+        /// `static function` — callable without an instance.
+        is_static: bool = false,
     };
 
     pub const Param = struct {
@@ -219,10 +227,19 @@ pub const Stmt = struct {
     };
 
     pub const ClassDecl = struct {
+        /// trait declaration marker (methods copied into using classes).
+        is_trait: bool = false,
         name: []const u8,
         extends: ?[]const u8,
+        implements: []const []const u8 = &.{},
+        /// `use TraitA, TraitB;` inside the class body.
+        uses: []const []const u8 = &.{},
+        /// Static property defaults (name -> constant value).
+        static_props: []const PropDecl = &.{},
         props: []const PropDecl,
         methods: []const FuncDecl,
+        /// true for interface declarations (methods have no bodies).
+        is_interface: bool = false,
     };
 
     pub const CatchClause = struct {

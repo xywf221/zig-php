@@ -72,5 +72,9 @@ pub const Func = struct {
     defaults: []?Value = &.{},
     /// Which parameters are `&by-reference`.
     by_ref_params: []const bool = &.{},
+    /// Owning class for methods (self:: resolution); null otherwise.
+    cls_name: ?[]const u8 = null,
+    /// Static method (no instance binding).
+    is_static: bool = false,
     chunk: Chunk = .{},
 };

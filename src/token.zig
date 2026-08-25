@@ -48,6 +48,13 @@ pub const Kind = enum {
     kw_throw,
     kw_try,
     kw_catch,
+    kw_interface,
+    kw_implements,
+    kw_trait,
+    kw_use,
+    kw_self,
+    kw_parent,
+    kw_static,
 
     // Punctuation
     lparen, // (
@@ -146,6 +153,13 @@ pub const keywords = std.StaticStringMap(Kind).initComptime(.{
     .{ "throw", .kw_throw },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
+    .{ "interface", .kw_interface },
+    .{ "implements", .kw_implements },
+    .{ "trait", .kw_trait },
+    .{ "use", .kw_use },
+    .{ "self", .kw_self },
+    .{ "parent", .kw_parent },
+    .{ "static", .kw_static },
 });
 
 pub const Token = struct {

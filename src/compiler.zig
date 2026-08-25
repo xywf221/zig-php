@@ -37,6 +37,8 @@ pub const Program = struct {
     hoisted: std.StringHashMapUnmanaged(void) = .empty,
     classes: std.StringHashMapUnmanaged(*ClassInfo) = .empty,
     hoisted_classes: std.StringHashMapUnmanaged(void) = .empty,
+    /// Trait declarations awaiting `use` inside classes.
+    traits: std.StringHashMapUnmanaged(ast.Stmt.ClassDecl) = .empty,
 };
 
 /// One property in a class's flattened layout (parent props first).
@@ -53,6 +55,13 @@ pub const ClassInfo = struct {
     /// Own properties as declared; VM flattens with parent layout on use.
     own_props: []const ClassProp = &.{},
     methods: std.StringHashMapUnmanaged(*Func) = .empty,
+    is_interface: bool = false,
+    /// Implemented interfaces (checked by instanceof / type checks).
+    interfaces: []const []const u8 = &.{},
+    /// Static property defaults (flattened with parents at VM init).
+    static_defaults: []const ClassProp = &.{},
+    /// Runtime static property storage (allocated at VM init).
+    statics: ?*std.StringHashMapUnmanaged(Value) = null,
 
     /// Walk the chain looking for a method (child overrides parent).
     pub fn findMethod(self: *ClassInfo, name: []const u8) ?*Func {
@@ -61,6 +70,16 @@ pub const ClassInfo = struct {
             if (cls.methods.get(name)) |f| return f;
         }
         return null;
+    }
+
+    /// True when this class implements/extends `iface` (transitively).
+    pub fn implementsIface(self: *ClassInfo, iface: []const u8) bool {
+        if (std.mem.eql(u8, self.name, iface)) return true;
+        for (self.interfaces) |i| {
+            if (std.mem.eql(u8, i, iface)) return true;
+        }
+        if (self.parent) |p| return p.implementsIface(iface);
+        return false;
     }
 };
 
@@ -199,7 +218,14 @@ pub const Compiler = struct {
     fn reserveLocalsExpr(arena: std.mem.Allocator, e: *ast.Expr, ctx: *FnCtx) Error!void {
         switch (e.kind) {
             .var_ref => |name| _ = try ctx.resolveLocal(arena, name),
-            .ref_arg => |inner| {
+            .static_get => {},
+            .static_set => |ss| {
+                try reserveLocalsExpr(arena, ss.value, ctx);
+            },
+            .static_call => |sc| {
+                for (sc.args) |arg| try reserveLocalsExpr(arena, arg, ctx);
+            },
+.ref_arg => |inner| {
                 try reserveLocalsExpr(arena, inner, ctx);
                 if (inner.kind == .var_ref) {
                     const slot = try ctx.resolveLocal(arena, inner.kind.var_ref);
@@ -304,11 +330,13 @@ pub const Compiler = struct {
     fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag, hoist: bool) Error!void {
         switch (st.kind) {
             .class_decl => |cd| {
-                if (!program.classes.contains(cd.name)) { // first wins
+                if (cd.is_trait) {
+                    if (!program.traits.contains(cd.name)) try program.traits.put(arena, cd.name, cd);
+                } else if (!program.classes.contains(cd.name)) { // first wins
                     const info = try compileClassUnit(arena, cd, diag, program);
                     try program.classes.put(arena, cd.name, info);
                 }
-                if (hoist) try program.hoisted_classes.put(arena, cd.name, {});
+                if (hoist and !cd.is_trait) try program.hoisted_classes.put(arena, cd.name, {});
             },
             .func_decl => |fd| {
                 if (!program.funcs.contains(fd.name)) { // first wins
@@ -333,18 +361,85 @@ pub const Compiler = struct {
 
     fn compileClassUnit(arena: std.mem.Allocator, cd: ast.Stmt.ClassDecl, diag: *Diag, program: *Program) Error!*ClassInfo {
         const info = try arena.create(ClassInfo);
-        info.* = .{ .name = cd.name, .parent_name = cd.extends };
+        info.* = .{
+            .name = cd.name,
+            .parent_name = cd.extends,
+            .is_interface = cd.is_interface,
+            .interfaces = cd.implements,
+        };
+
+        // Trait flattening: `use T` copies trait methods (class wins).
+        var methods: std.ArrayList(ast.Stmt.FuncDecl) = .empty;
+        for (cd.uses) |tname| {
+            const tr = program.traits.get(tname) orelse {
+                diag.msg = try std.fmt.allocPrint(arena, "Trait '{s}' not found (declare traits before use)", .{tname});
+                diag.line = 0;
+                return error.SyntaxError;
+            };
+            for (tr.methods) |m| try methods.append(arena, m);
+        }
+        for (cd.methods) |m| try methods.append(arena, m); // class overrides traits
+
+        // Interface conformance: every interface method must exist.
+        for (cd.implements) |iname| {
+            const iface = program.classes.get(iname) orelse {
+                diag.msg = try std.fmt.allocPrint(arena, "Interface '{s}' not found (declare interfaces before use)", .{iname});
+                diag.line = 0;
+                return error.SyntaxError;
+            };
+            if (!iface.is_interface) {
+                diag.msg = try std.fmt.allocPrint(arena, "'{s}' is not an interface", .{iname});
+                diag.line = 0;
+                return error.SyntaxError;
+            }
+            var im_it = iface.methods.iterator();
+            while (im_it.next()) |im_e| {
+                const im_name = im_e.key_ptr.*;
+                var found = false;
+                for (methods.items) |m| {
+                    if (std.mem.eql(u8, m.name, im_name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    diag.msg = try std.fmt.allocPrint(arena, "{s} contains 1 abstract method and must therefore be declared abstract or implement {s}::{s}()", .{ cd.name, iname, im_name });
+                    diag.line = 0;
+                    return error.SyntaxError;
+                }
+            }
+        }
+
+        // Static property defaults.
+        const sprops = try arena.alloc(ClassProp, cd.static_props.len);
+        for (cd.static_props, 0..) |p, i| {
+            sprops[i] = .{ .name = p.name, .default = p.default orelse valmod.Value.null_ };
+        }
+        info.static_defaults = sprops;
+
         const props = try arena.alloc(ClassProp, cd.props.len);
         for (cd.props, 0..) |p, i| {
             props[i] = .{ .name = p.name, .default = p.default orelse valmod.Value.null_ };
         }
         info.own_props = props;
-        for (cd.methods) |m| {
+
+        for (methods.items) |m| {
             if (info.methods.contains(m.name)) continue; // first wins
-            const f = try compileFuncUnit(arena, m, diag, true, program);
+            const is_abstract = cd.is_interface;
+            _ = is_abstract;
+            const f = try compileMethodUnit(arena, m, diag, program, cd.name, m.is_static);
             try info.methods.put(arena, m.name, f);
         }
         return info;
+    }
+
+    /// Method variant of compileFuncUnit: binds cls context, honours
+    /// static-ness (no implicit $this), accepts empty bodies (interfaces).
+    fn compileMethodUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag, program: *Program, cls_name: []const u8, is_static: bool) Error!*Func {
+        const f = try compileFuncUnit(arena, fd, diag, !is_static, program);
+        f.cls_name = cls_name;
+        f.is_static = is_static;
+        return f;
     }
 
     fn compileFuncUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag, implicit_this: bool, program: *Program) Error!*Func {
@@ -1076,6 +1171,30 @@ pub const Compiler = struct {
                 t.release(&self.ctx);
             },
 
+            .static_get => |sg| {
+                const kcls = try self.nameConst(sg.cls);
+                const kname = try self.nameConst(sg.name);
+                _ = try self.emit3(.static_get, dst, kcls, kname, line);
+            },
+            .static_set => |ss| {
+                const tv = try self.exprToTemp(ss.value);
+                const kcls = try self.nameConst(ss.cls);
+                const kname = try self.nameConst(ss.name);
+                _ = try self.emit3(.static_set, kcls, kname, tv.reg, line);
+                _ = try self.emit2(.mov, dst, tv.reg, line);
+                tv.release(&self.ctx);
+            },
+            .static_call => |sc| {
+                const n2 = @max(sc.args.len, 1);
+                const base = self.ctx.allocBlock(n2);
+                for (sc.args, 0..) |ae, i| try self.compileInto(base + @as(u32, @intCast(i)), ae);
+                const kn = try self.nameConst(sc.name);
+                const kc = try self.nameConst(sc.cls);
+                _ = try self.emit3(.static_call, @intCast(sc.args.len), base, kn, line);
+                _ = try self.emitInline(kc, line); // class const idx as inline word
+                if (dst != base) _ = try self.emit2(.mov, dst, base, line);
+                self.ctx.freeBlock(base, n2);
+            },
             .ref_arg => |inner| {
                 // By-reference argument: materialize the lvalue's container.
                 switch (inner.kind) {
@@ -1298,6 +1417,27 @@ pub const Compiler = struct {
                 self.ctx.freeReg(parent);
             },
 
+            .static_get => |sg| {
+                // Cls::$name = v / += etc.
+                const kcls = try self.nameConst(sg.cls);
+                const kname = try self.nameConst(sg.name);
+                if (a.op == .assign) {
+                    const tv = try self.exprToTemp(a.value);
+                    _ = try self.emit3(.static_set, kcls, kname, tv.reg, line);
+                    _ = try self.emit2(.mov, dst, tv.reg, line);
+                    tv.release(&self.ctx);
+                } else {
+                    const told = self.ctx.alloc();
+                    _ = try self.emit3(.static_get, told, kcls, kname, line);
+                    const tv = try self.exprToTemp(a.value);
+                    _ = try self.emit3(binOpOf(compoundBinOp(a.op)), tv.reg, told, tv.reg, line);
+                    _ = try self.emit3(.static_set, kcls, kname, tv.reg, line);
+                    if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                    self.ctx.freeReg(tv.reg);
+                    self.ctx.freeReg(told);
+                }
+            },
+
             .prop_get => |pg| {
                 const to = try self.exprToTemp(pg.obj);
                 const k = try self.nameConst(pg.name);
@@ -1379,6 +1519,25 @@ pub const Compiler = struct {
                 }
                 self.ctx.freeReg(tk.reg);
                 self.ctx.freeReg(parent);
+            },
+            .static_get => |sg| {
+                const kcls = try self.nameConst(sg.cls);
+                const kname = try self.nameConst(sg.name);
+                if (postfix) {
+                    const told = self.ctx.alloc();
+                    _ = try self.emit3(.static_get, told, kcls, kname, line);
+                    _ = try self.emit1(if (up) .inc_l else .dec_l, told, line);
+                    _ = try self.emit3(.static_set, kcls, kname, told, line);
+                    _ = try self.emit2(.mov, dst, told, line); // old value
+                    self.ctx.freeReg(told);
+                } else {
+                    const told = self.ctx.alloc();
+                    _ = try self.emit3(.static_get, told, kcls, kname, line);
+                    _ = try self.emit1(if (up) .inc_l else .dec_l, told, line);
+                    _ = try self.emit3(.static_set, kcls, kname, told, line);
+                    _ = try self.emit2(.mov, dst, told, line); // new value
+                    self.ctx.freeReg(told);
+                }
             },
             .prop_get => |pg| {
                 const to = try self.exprToTemp(pg.obj);

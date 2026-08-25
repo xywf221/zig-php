@@ -115,6 +115,14 @@ pub const Op = enum(u8) {
     make_ref_cell,
     /// regs[a] = the .ref_ cell in regs[b]
     bind_ref,
+
+    // -- static members ---------------------------------------------------------------
+    /// a = Class(consts[b])::$consts[c]   (class: name/self/parent/static)
+    static_get,
+    /// Class(consts[a])::$consts[b] = regs[c]
+    static_set,
+    /// Class(consts inline)::consts[c](regs[b..b+a]) — result overwrites b
+    static_call,
     /// a = get-or-create shared Cell for regs[b][regs[c]] (array element)
     elem_cell,
 

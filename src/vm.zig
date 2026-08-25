@@ -77,11 +77,38 @@ pub const Vm = struct {
         while (cit.next()) |key| {
             vm.declared_classes.put(arena, key.*, {}) catch {};
         }
-        // Resolve parent links (all classes are compiled by now).
+        // Resolve parent links (all classes are compiled by now) and set up
+        // static property storage flattened with parent defaults.
         var pit = program.classes.iterator();
         while (pit.next()) |entry| {
             const info = entry.value_ptr.*;
             if (info.parent_name) |pname| info.parent = program.classes.get(pname);
+        }
+        var sit = program.classes.iterator();
+        while (sit.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (!info.is_interface and info.statics == null) {
+                const map = arena.create(std.StringHashMapUnmanaged(Value)) catch continue;
+                map.* = .empty;
+                // Parent-first flattening.
+                var chain: [64]*compiler_mod.ClassInfo = undefined;
+                var depth: usize = 0;
+                var c2: ?*compiler_mod.ClassInfo = info;
+                while (c2) |cl| : (c2 = cl.parent) {
+                    if (depth >= 64) break;
+                    chain[depth] = cl;
+                    depth += 1;
+                }
+                var di: usize = depth;
+                while (di > 0) {
+                    di -= 1;
+                    for (chain[di].static_defaults) |p| {
+                        map.put(arena, p.name, p.default) catch {};
+                    }
+                }
+                info.statics = map;
+                // Interfaces in the chain need statics maps too? no.
+            }
         }
         return vm;
     }
@@ -158,14 +185,18 @@ pub const Vm = struct {
     }
 
     /// Run the top frame until it returns or calls deeper.
+    ///
+    /// NOTE: `f` is re-derived at the top of every iteration — nested calls
+    /// append to `frames`, and an ArrayList realloc would otherwise leave
+    /// this pointer dangling (latent bug that silently corrupted execution).
     fn dispatch(self: *Vm) Error!void {
-        const fi = self.frames.items.len - 1;
-        var f = &self.frames.items[fi];
+        var f = &self.frames.items[self.frames.items.len - 1];
         const code = f.func.chunk.code.items;
         const consts = f.func.chunk.consts.items;
         const lines = f.func.chunk.lines.items;
 
         while (true) {
+            f = &self.frames.items[self.frames.items.len - 1];
             // Single bounds check guards both code[] and lines[] (they are
             // kept exactly parallel by Chunk.emit).
             if (f.ip >= code.len) {
@@ -444,6 +475,35 @@ pub const Vm = struct {
                     const nv = incValue(old, up, self.arena);
                     try o.obj_.set(self.arena, k, nv);
                     regs[ins.a] = old;
+                },
+
+                // -- static members ---------------------------------------------------
+                .static_get => {
+                    const cls = try self.resolveStaticClass(f, consts[ins.b].str_.data, line);
+                    const name = consts[ins.c].str_.data;
+                    const store = staticsFor(cls);
+                    regs[ins.a] = store.get(name) orelse blk: {
+                        self.warn(line, "Undefined static property: {s}::${s}", .{ cls.name, name });
+                        break :blk .null_;
+                    };
+                },
+                .static_set => {
+                    const cls = try self.resolveStaticClass(f, consts[ins.a].str_.data, line);
+                    const name = consts[ins.b].str_.data;
+                    try staticsFor(cls).put(self.arena, name, regs[ins.c]);
+                },
+                .static_call => {
+                    const cls_ci: u32 = code[f.ip].a; // inline word
+                    f.ip += 1;
+                    const cls = try self.resolveStaticClass(f, consts[cls_ci].str_.data, line);
+                    const mname = consts[ins.c].str_.data;
+                    const mf = cls.findMethod(mname) orelse
+                        return self.fatalF(line, "Call to undefined method {s}::{s}()", .{ cls.name, mname });
+                    if (!mf.is_static) {
+                        // PHP allows calling non-static via ::? Deprecated; fatal for clarity.
+                        return self.fatalF(line, "Non-static method {s}::{s}() cannot be called statically", .{ cls.name, mname });
+                    }
+                    try self.invokeUser(mf, ins.b, ins.a, ins.b, null, line);
                 },
 
                 // -- exceptions -------------------------------------------------------
@@ -985,6 +1045,31 @@ pub const Vm = struct {
         return obj;
     }
 
+    /// Resolve the class named `given` relative to the current method's
+    /// class ("self"/"parent"/"static" keywords).
+    fn resolveStaticClass(self: *Vm, f: *Frame, given: []const u8, line: u32) Error!*compiler_mod.ClassInfo {
+        if (std.mem.eql(u8, given, "self") or std.mem.eql(u8, given, "static")) {
+            const cn = f.func.cls_name orelse
+                return self.fatalF(line, "cannot use {s} outside of a class", .{given});
+            return self.program.classes.get(cn) orelse
+                return self.fatalF(line, "Class \"{s}\" not found", .{cn});
+        }
+        if (std.mem.eql(u8, given, "parent")) {
+            const cn = f.func.cls_name orelse
+                return self.fatalF(line, "cannot use parent outside of a class", .{});
+            const cls = self.program.classes.get(cn) orelse
+                return self.fatalF(line, "Class \"{s}\" not found", .{cn});
+            return cls.parent orelse
+                return self.fatalF(line, "cannot use parent when extending nothing", .{});
+        }
+        return self.program.classes.get(given) orelse
+            return self.fatalF(line, "Class \"{s}\" not found", .{given});
+    }
+
+    fn staticsFor(cls: *compiler_mod.ClassInfo) *std.StringHashMapUnmanaged(Value) {
+        return cls.statics.?;
+    }
+
     /// True when thrown class is catchable as `target` (builtin hierarchy +
     /// user classes).
     fn exMatches(self: *Vm, thrown_class: []const u8, target: []const u8) bool {
@@ -1075,11 +1160,28 @@ pub const Vm = struct {
         if (std.mem.eql(u8, name, ancestor)) return true;
         var cur = self.program.classes.get(name);
         while (cur) |cls| : (cur = cls.parent) {
+            // Interfaces on every class in the chain count too.
+            for (cls.interfaces) |ifn| {
+                if (self.ifaceSatisfied(ifn, ancestor)) return true;
+            }
             if (cls.parent_name) |pn| {
                 if (std.mem.eql(u8, pn, ancestor)) return true;
                 cur = self.program.classes.get(pn); // continue from parent
                 if (cur == null) return false;
             } else return false;
+        }
+        return false;
+    }
+
+    /// Interface hierarchy check: iface == target, extends target, or any of
+    /// its parents matches.
+    fn ifaceSatisfied(self: *Vm, iface: []const u8, target: []const u8) bool {
+        var cur: ?[]const u8 = iface;
+        while (cur) |i| : (cur = blk: {
+            const ic = self.program.classes.get(i) orelse break :blk null;
+            break :blk ic.parent_name;
+        }) {
+            if (std.mem.eql(u8, i, target)) return true;
         }
         return false;
     }

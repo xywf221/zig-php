@@ -164,6 +164,8 @@ pub const Parser = struct {
             .kw_foreach => return self.parseForeach(),
             .kw_function => return self.parseFunction(),
             .kw_class => return self.parseClassDecl(),
+            .kw_interface => return self.parseInterfaceDecl(),
+            .kw_trait => return self.parseTraitDecl(),
             .kw_throw => {
                 _ = self.advance();
                 const e = try self.parseExpr();
@@ -276,6 +278,11 @@ pub const Parser = struct {
     }
 
     fn parseFunction(self: *Parser) Error!*ast.Stmt {
+        return self.parseFunctionOpts(false);
+    }
+
+    /// `allow_abstract` accepts `function m(...);` (interface methods).
+    fn parseFunctionOpts(self: *Parser, allow_abstract: bool) Error!*ast.Stmt {
         const t = self.advance(); // function
         const name_tok = try self.expect(.ident);
         _ = try self.expect(.lparen);
@@ -292,6 +299,13 @@ pub const Parser = struct {
             }
         }
         _ = try self.expect(.rparen);
+        if (allow_abstract and self.accept(.semicolon)) {
+            return self.stmt(.{ .func_decl = .{
+                .name = name_tok.text,
+                .params = try params.toOwnedSlice(self.arena),
+                .body = &.{},
+            } }, t.line);
+        }
         const body = try self.parseBody();
         return self.stmt(.{ .func_decl = .{
             .name = name_tok.text,
@@ -635,6 +649,31 @@ pub const Parser = struct {
                     _ = try self.expect(.rparen);
                     e = try self.expr(.{ .call = .{ .name = name, .args = args } }, line);
                 },
+                .dbl_colon => {
+                    // Static access: preceding must be a class-name token
+                    // (ident / self / parent — captured as var_ref).
+                    _ = self.advance();
+                    var cls: []const u8 = "";
+                    switch (e.kind) {
+                        .var_ref => |n| cls = n,
+                        .str_lit => |x| cls = x,
+                        else => return self.fail("dynamic '::' access is not supported", .{}),
+                    }
+                    if (self.check(.variable)) {
+                        const pt = self.advance(); // $prop
+                        e = try self.expr(.{ .static_get = .{ .cls = cls, .name = pt.text[1..] } }, line);
+                    } else {
+                        const mt = try self.expect(.ident);
+                        if (self.check(.lparen)) {
+                            _ = self.advance();
+                            const args = if (self.check(.rparen)) try self.arena.alloc(*ast.Expr, 0) else try self.parseCallArgs(.rparen);
+                            _ = try self.expect(.rparen);
+                            e = try self.expr(.{ .static_call = .{ .cls = cls, .name = mt.text, .args = args } }, line);
+                        } else {
+                            return self.fail("class constants are not supported", .{});
+                        }
+                    }
+                },
                 .object_op => {
                     _ = self.advance();
                     const name_tok = try self.expect(.ident);
@@ -729,6 +768,10 @@ pub const Parser = struct {
             _ = self.advance();
             return self.expr(.{ .var_ref = "this" }, t.line);
         },
+        .kw_self, .kw_parent => {
+            _ = self.advance();
+            return self.expr(.{ .var_ref = t.text }, t.line); // consumed by '::'
+        },
         .lparen => {
                 _ = self.advance();
                 const inner = try self.parseExpr();
@@ -757,8 +800,13 @@ pub const Parser = struct {
             },
             .ident => {
                 // A bare identifier is an Error under PHP 8 semantics...
-                // unless it's immediately called as a function name.
+                // unless it's immediately called as a function name or used
+                // as a static class name (`Cls::`).
                 if (self.toks[self.i + 1].kind == .lparen) {
+                    _ = self.advance();
+                    return self.expr(.{ .str_lit = t.text }, t.line);
+                }
+                if (self.toks[self.i + 1].kind == .dbl_colon) {
                     _ = self.advance();
                     return self.expr(.{ .str_lit = t.text }, t.line);
                 }
@@ -811,25 +859,79 @@ pub const Parser = struct {
     /// class Name extends Base { props & methods }
     /// Visibility keywords are accepted and ignored (all members public).
     fn parseClassDecl(self: *Parser) Error!*ast.Stmt {
-        const t = self.advance(); // class
+        return self.parseClassLike(false);
+    }
+
+    fn parseInterfaceDecl(self: *Parser) Error!*ast.Stmt {
+        return self.parseClassLike(true);
+    }
+
+    fn parseTraitDecl(self: *Parser) Error!*ast.Stmt {
+        const t = self.advance(); // trait
+        const name_tok = try self.expect(.ident);
+        _ = try self.expect(.lbrace);
+        var methods: std.ArrayList(ast.Stmt.FuncDecl) = .empty;
+        while (!self.check(.rbrace)) {
+            _ = self.accept(.kw_public) or self.accept(.kw_private) or self.accept(.kw_protected);
+            if (self.check(.kw_function)) {
+                const m = try self.parseFunction();
+                try methods.append(self.arena, m.kind.func_decl);
+            } else {
+                return self.fail("unexpected '{s}' in trait body", .{self.cur().text});
+            }
+        }
+        _ = try self.expect(.rbrace);
+        return self.stmt(.{ .class_decl = .{
+            .name = name_tok.text,
+            .extends = null,
+            .props = &.{},
+            .methods = try methods.toOwnedSlice(self.arena),
+            .is_trait = true,
+        } }, t.line);
+    }
+
+    fn parseClassLike(self: *Parser, is_interface: bool) Error!*ast.Stmt {
+        const t = self.advance(); // class / interface
         const name_tok = try self.expect(.ident);
         var extends: ?[]const u8 = null;
         if (self.accept(.kw_extends)) {
             extends = (try self.expect(.ident)).text;
         }
+        var implements: std.ArrayList([]const u8) = .empty;
+        if (self.accept(.kw_implements)) {
+            while (true) {
+                const it = try self.expect(.ident);
+                try implements.append(self.arena, it.text);
+                if (!self.accept(.comma)) break;
+            }
+        }
         _ = try self.expect(.lbrace);
 
         var props: std.ArrayList(ast.Stmt.PropDecl) = .empty;
+        var static_props: std.ArrayList(ast.Stmt.PropDecl) = .empty;
         var methods: std.ArrayList(ast.Stmt.FuncDecl) = .empty;
+        var uses: std.ArrayList([]const u8) = .empty;
         while (!self.check(.rbrace)) {
+            var is_static = false;
             if (self.accept(.kw_public) or self.accept(.kw_private) or self.accept(.kw_protected)) {
                 // visibility ignored
-            } else if (self.check(.ident) and std.mem.eql(u8, self.cur().text, "static")) {
-                return self.fail("static properties/methods are not supported", .{});
+            }
+            if (self.accept(.kw_static)) is_static = true;
+            if (self.check(.kw_use)) {
+                _ = self.advance();
+                while (true) {
+                    const tn = try self.expect(.ident);
+                    try uses.append(self.arena, tn.text);
+                    if (!self.accept(.comma)) break;
+                }
+                _ = try self.expect(.semicolon);
+                continue;
             }
             if (self.check(.kw_function)) {
-                const m = try self.parseFunction();
-                try methods.append(self.arena, m.kind.func_decl);
+                const m = try self.parseFunctionOpts(is_interface);
+                var fd = m.kind.func_decl;
+                fd.is_static = is_static;
+                try methods.append(self.arena, fd);
             } else if (self.check(.variable)) {
                 const p = self.advance();
                 var default_val: ?valmod.Value = null;
@@ -837,7 +939,11 @@ pub const Parser = struct {
                     default_val = try self.parseConstDefault();
                 }
                 _ = try self.expect(.semicolon);
-                try props.append(self.arena, .{ .name = p.text[1..], .default = default_val });
+                const decl = ast.Stmt.PropDecl{ .name = p.text[1..], .default = default_val };
+                if (is_interface) {
+                    return self.fail("interfaces cannot have properties", .{});
+                }
+                if (is_static) try static_props.append(self.arena, decl) else try props.append(self.arena, decl);
             } else {
                 return self.fail("unexpected '{s}' in class body", .{self.cur().text});
             }
@@ -846,8 +952,12 @@ pub const Parser = struct {
         return self.stmt(.{ .class_decl = .{
             .name = name_tok.text,
             .extends = extends,
+            .implements = try implements.toOwnedSlice(self.arena),
+            .uses = try uses.toOwnedSlice(self.arena),
+            .static_props = try static_props.toOwnedSlice(self.arena),
             .props = try props.toOwnedSlice(self.arena),
             .methods = try methods.toOwnedSlice(self.arena),
+            .is_interface = is_interface,
         } }, t.line);
     }
 

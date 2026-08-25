@@ -297,6 +297,35 @@ test "array aliasing through reference" {
 }
 
 // ===========================================================================
+// Interfaces / traits / static members
+// ===========================================================================
+
+test "static properties and methods with self::" {
+    try expectOut("class D { public static $n = 5; " ++
+        "public static function get() { return self::$n; } " ++
+        "public static function bump() { self::$n += 1; return self::$n; } } " ++
+        "echo D::get(), '|', D::bump(), '|', D::$n;", "5|6|6");
+    try expectOut("class E { public static $c = 0; public function __construct() { self::$c++; } } " ++
+        "$x = new E(); $y = new E(); echo E::$c;", "2");
+}
+
+test "interfaces: conformance enforced, instanceof works" {
+    try expectOut("interface I { public function m(); } " ++
+        "class K implements I { public function m() { return 'ok'; } } " ++
+        "echo (new K())->m(), (new K()) instanceof I ? 1 : 0;", "ok1");
+    // Missing interface method -> compile error.
+    if (runCode("interface I2 { public function m(); } class Bad implements I2 { }")) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "traits flatten into classes" {
+    try expectOut("trait T { public function hi() { return 't:' . $this->w; } } " ++
+        "class H { use T; public $w = 'world'; } " ++
+        "echo (new H())->hi();", "t:world");
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 
