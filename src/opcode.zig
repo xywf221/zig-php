@@ -92,6 +92,20 @@ pub const Op = enum(u8) {
     prop_post_inc,
     prop_post_dec,
 
+    // -- exceptions -----------------------------------------------------------------
+    /// push a try region (inline word: handler address, patched)
+    try_start,
+    /// pop the active try region
+    try_end,
+    /// throw regs[b]
+    throw_v,
+    /// a = pending exception class ∈ consts[c] clause types
+    catch_match,
+    /// a = pending exception value (and clear it)
+    catch_store,
+    /// re-throw the pending exception (no clause matched)
+    rethrow,
+
     // -- strings / output ----------------------------------------------------------------------
     strconcat, // a = join(regs[b] .. regs[b+c-1]) stringified
     echo, // print regs[a] .. regs[a+b-1]

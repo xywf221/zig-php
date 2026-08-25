@@ -219,6 +219,38 @@ test "compound ops on properties and dynamic props" {
 }
 
 // ===========================================================================
+// Exceptions
+// ===========================================================================
+
+test "throw/catch basic + getMessage" {
+    try expectOut("try { throw new Exception('boom'); } catch (Exception $e) { echo 'got: ', $e->getMessage(); }", "got: boom");
+}
+
+test "clause order and hierarchy matching" {
+    try expectOut("try { throw new Exception('x'); } catch (TypeError $e) { echo 1; } catch (Exception $e) { echo 2; }", "2");
+    try expectOut("try { throw new DivisionByZeroError('dz'); } catch (ArithmeticError $e) { echo 'arith'; }", "arith");
+}
+
+test "nested try: inner mismatch falls to outer" {
+    try expectOut("try { try { throw new Exception('in'); } catch (TypeError $e) { echo 'no'; } } " ++
+        "catch (Exception $e) { echo 'outer:', $e->getMessage(); }", "outer:in");
+}
+
+test "division by zero is a catchable DivisionByZeroError" {
+    try expectOut("try { echo 1/0; } catch (DivisionByZeroError $e) { echo 'caught: ', $e->getMessage(); }", "caught: Division by zero");
+}
+
+test "exception escaping function unwinds through calls" {
+    try expectOut("function f() { throw new Exception('deep'); } " ++
+        "function g() { f(); } " ++
+        "try { g(); } catch (Exception $e) { echo 'unwound: ', $e->getMessage(); }", "unwound: deep");
+}
+
+test "uncaught exception is fatal" {
+    try expectFatal("throw new Exception('boom');", "Uncaught Exception: boom");
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 
@@ -263,7 +295,9 @@ test "string-number coercion in arithmetic" {
 }
 
 test "division by zero is fatal" {
-    try expectFatal("echo 1 / 0;", "Division by zero");
+    // 1/0 throws a DivisionByZeroError (catchable — see exceptions tests);
+    // uncaught, it surfaces as this fatal.
+    try expectFatal("echo 1 / 0;", "Uncaught DivisionByZeroError: Division by zero");
     try expectFatal("echo 1 % 0;", "Modulo by zero");
 }
 

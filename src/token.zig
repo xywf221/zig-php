@@ -45,6 +45,9 @@ pub const Kind = enum {
     kw_new,
     kw_this,
     kw_instanceof,
+    kw_throw,
+    kw_try,
+    kw_catch,
 
     // Punctuation
     lparen, // (
@@ -140,6 +143,9 @@ pub const keywords = std.StaticStringMap(Kind).initComptime(.{
     .{ "new", .kw_new },
     .{ "this", .kw_this },
     .{ "instanceof", .kw_instanceof },
+    .{ "throw", .kw_throw },
+    .{ "try", .kw_try },
+    .{ "catch", .kw_catch },
 });
 
 pub const Token = struct {

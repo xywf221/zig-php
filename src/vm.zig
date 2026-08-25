@@ -22,6 +22,7 @@ const Func = chunkmod.Func;
 
 pub const Error = error{
     Fatal,
+    Thrown,
     OutOfMemory,
 } || std.Io.Writer.Error;
 
@@ -42,6 +43,8 @@ pub const Vm = struct {
     frames: std.ArrayList(Frame) = .empty,
     /// Pooled register files for call frames (bounded recycling).
     reg_pool: std.ArrayList([]Value) = .empty,
+    /// Pending exception during unwinding (null when not throwing).
+    pending_ex: ?*valmod.Object = null,
 
     // Diagnostics.
     msg: []const u8 = "",
@@ -53,6 +56,8 @@ pub const Vm = struct {
         regs: []Value,
         /// foreach snapshot/cursor pairs, indexed by hidden id.
         hidden: []Value,
+        /// Active try regions (stack; top = innermost).
+        tries: std.ArrayList(usize) = .empty,
         /// Where to store this frame's return value in the CALLER's registers.
         result_reg: u32,
     };
@@ -125,10 +130,30 @@ pub const Vm = struct {
         try self.runFrame();
     }
 
-    /// Run frames until the bottom frame returns.
+    /// Run frames until the bottom frame returns. An exception escaping the
+    /// top-level script becomes an uncaught fatal.
     fn runFrame(self: *Vm) Error!void {
         while (self.frames.items.len > 0) {
-            try self.dispatch();
+            self.dispatch() catch |e| switch (e) {
+                error.Thrown => {
+                    // Unwind main-frame regions first (top-level try).
+                    const f = &self.frames.items[self.frames.items.len - 1];
+                    if (self.unwindToRegion()) |handler_ip| {
+                        f.ip = handler_ip;
+                        continue;
+                    }
+                    if (self.pending_ex) |ex| {
+                        const msg = try valmod.toString(ex.get("message") orelse .null_, self.arena);
+                        const eline: u32 = switch (ex.get("line") orelse .null_) {
+                            .int_ => |i| @intCast(@max(i, 0)),
+                            else => 0,
+                        };
+                        return self.fatalF(eline, "Uncaught {s}: {s}", .{ ex.class_name, msg });
+                    }
+                    return e;
+                },
+                else => return e,
+            };
         }
     }
 
@@ -293,6 +318,15 @@ pub const Vm = struct {
                 },
                 .new_obj => {
                     const cls_name = consts[ins.c].str_;
+                    // Builtin exception classes: synthesize message/code/line.
+                    if (self.program.classes.get(cls_name) == null and isBuiltinException(cls_name)) {
+                        const msg: []const u8 = if (ins.a > 0)
+                            try valmod.toString(f.regs[ins.b + 1], self.arena)
+                        else
+                            "";
+                        const obj = try self.newBuiltinException(cls_name, msg, line);
+                        regs[ins.b] = .{ .obj_ = obj };
+                    } else {
                     if (!self.declared_classes.contains(cls_name)) {
                         return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
                     }
@@ -321,6 +355,7 @@ pub const Vm = struct {
                         // Result goes nowhere: the instance stays in regs[b].
                         try self.invokeUser(ctor, ins.b + 1, ins.a, opcode.no_reg, obj, line);
                     }
+                    }
                 },
                 .get_prop => {
                     const o = regs[ins.b];
@@ -339,6 +374,22 @@ pub const Vm = struct {
                 .call_method => {
                     const obj_val = f.regs[ins.b];
                     if (obj_val != .obj_) return self.fatalF(line, "call to member function on {s}", .{obj_val.typeName()});
+                    const mname0 = consts[ins.c].str_;
+                    // Builtin exception accessors.
+                    if (isBuiltinException(obj_val.obj_.class_name)) {
+                        if (std.mem.eql(u8, mname0, "getMessage")) {
+                            regs[ins.b] = obj_val.obj_.get("message") orelse .null_;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, mname0, "getCode")) {
+                            regs[ins.b] = obj_val.obj_.get("code") orelse .null_;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, mname0, "getLine")) {
+                            regs[ins.b] = obj_val.obj_.get("line") orelse .null_;
+                            continue;
+                        }
+                    }
                     const cls_name = obj_val.obj_.class_name;
                     const info = self.program.classes.get(cls_name) orelse
                         return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
@@ -373,6 +424,42 @@ pub const Vm = struct {
                     const nv = incValue(old, up, self.arena);
                     try o.obj_.set(self.arena, k, nv);
                     regs[ins.a] = old;
+                },
+
+                // -- exceptions -------------------------------------------------------
+                .try_start => {
+                    try f.tries.append(self.arena, ins.a); // handler address
+                },
+                .try_end => {
+                    _ = f.tries.pop();
+                },
+                .throw_v => {
+                    const v = regs[ins.b];
+                    if (v != .obj_ or !self.isThrowableClass(v.obj_.class_name)) {
+                        return self.fatalF(line, "Uncaught Error: Value of type {s} is not throwable", .{v.typeName()});
+                    }
+                    self.pending_ex = v.obj_;
+                    try self.throwInCurrentFrame(f);
+                },
+                .rethrow => {
+                    if (self.pending_ex == null) return self.fatalF(line, "internal: rethrow without pending exception", .{});
+                    try self.throwInCurrentFrame(f);
+                },
+                .catch_match => {
+                    const ex = self.pending_ex.?;
+                    const types = f.func.chunk.catch_types.items[ins.c];
+                    var matched = false;
+                    for (types) |ty| {
+                        if (self.exMatches(ex.class_name, ty)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    regs[ins.a] = .{ .bool_ = matched };
+                },
+                .catch_store => {
+                    regs[ins.a] = .{ .obj_ = self.pending_ex.? };
+                    self.pending_ex = null;
                 },
                 .warn_undef => {
                     const name = f.func.chunk.consts.items[ins.a].str_;
@@ -625,7 +712,10 @@ pub const Vm = struct {
                     return .{ .float_ = @as(f64, @floatFromInt(x)) * @as(f64, @floatFromInt(y)) };
                 },
                 .div => {
-                    if (y == 0) return self.fatalF(line, "Division by zero", .{});
+                    if (y == 0) {
+                        try self.throwBuiltin(line, "DivisionByZeroError", "Division by zero");
+                        return .null_; // unreachable: throwBuiltin always errors
+                    }
                     if (@rem(x, y) == 0) return .{ .int_ = @divTrunc(x, y) };
                     return .{ .float_ = @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y)) };
                 },
@@ -726,8 +816,21 @@ pub const Vm = struct {
             });
 
             // Execute callee to completion; depth bounded by MAX_CALL_DEPTH.
-            try self.dispatch();
-            return;
+            // An escaping exception unwinds INTO this frame: check our active
+            // try regions around the call site before propagating further.
+            if (self.dispatch()) |_| {
+                return;
+            } else |e| switch (e) {
+                error.Thrown => {
+                    _ = self.frames.pop(); // discard aborted callee
+                    if (self.unwindToRegion()) |handler_ip| {
+                        self.frames.items[self.frames.items.len - 1].ip = handler_ip;
+                        return; // caller continues into its catch dispatcher
+                    }
+                    return e;
+                },
+                else => return e,
+            }
         }
 
         // Builtins receive a view of the caller's registers.
@@ -745,6 +848,91 @@ pub const Vm = struct {
     /// (when non-null), declared args copy from caller regs[args_base..],
     /// defaults fill the rest, and the return value is written back to
     /// caller's result_dst register.
+    /// Pop the innermost active try region of the current (top) frame and
+    /// return its handler address; null when no region is active.
+    fn unwindToRegion(self: *Vm) ?usize {
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        if (frame.tries.items.len == 0) return null;
+        return frame.tries.pop();
+    }
+
+    /// Static builtin exception hierarchy (Throwable root implied).
+    const exception_parents = [_]struct { child: []const u8, parent: []const u8 }{
+        .{ .child = "RuntimeException", .parent = "Exception" },
+        .{ .child = "LogicException", .parent = "Exception" },
+        .{ .child = "Error", .parent = "Throwable" },
+        .{ .child = "Exception", .parent = "Throwable" },
+        .{ .child = "TypeError", .parent = "Error" },
+        .{ .child = "ValueError", .parent = "Error" },
+        .{ .child = "ArithmeticError", .parent = "Error" },
+        .{ .child = "DivisionByZeroError", .parent = "ArithmeticError" },
+        .{ .child = "ArgumentCountError", .parent = "TypeError" },
+        .{ .child = "UnhandledMatchError", .parent = "Error" },
+    };
+
+    /// True when `name` names a builtin exception class.
+    fn isBuiltinException(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "Throwable")) return true;
+        for (exception_parents) |e| {
+            if (std.mem.eql(u8, e.child, name)) return true;
+        }
+        return false;
+    }
+
+    fn exceptionParentOf(name: []const u8) ?[]const u8 {
+        for (exception_parents) |e| {
+            if (std.mem.eql(u8, e.child, name)) return e.parent;
+        }
+        return null;
+    }
+
+    /// Create a builtin exception instance: props message/code/line.
+    fn newBuiltinException(self: *Vm, class_name: []const u8, msg: []const u8, line: u32) !*valmod.Object {
+        const obj = try valmod.Object.create(self.arena, class_name);
+        try obj.props.append(self.arena, .{ .name = "message", .val = .{ .str_ = msg } });
+        try obj.props.append(self.arena, .{ .name = "code", .val = .{ .int_ = 0 } });
+        try obj.props.append(self.arena, .{ .name = "line", .val = .{ .int_ = @intCast(line) } });
+        return obj;
+    }
+
+    /// True when thrown class is catchable as `target` (builtin hierarchy +
+    /// user classes).
+    fn exMatches(self: *Vm, thrown_class: []const u8, target: []const u8) bool {
+        var cur: ?[]const u8 = thrown_class;
+        while (cur) |c| : (cur = exceptionParentOf(c)) {
+            if (std.mem.eql(u8, c, target)) return true;
+            // User-defined parent chain (only when not purely builtin).
+            if (!isBuiltinException(c)) {
+                if (self.classExtends(c, target)) return true;
+                break;
+            }
+        }
+        return false;
+    }
+
+    /// Throw from the current frame: jump to its innermost region handler or
+    /// start unwinding to the caller.
+    fn throwInCurrentFrame(self: *Vm, f: *Frame) Error!void {
+        _ = self;
+        if (f.tries.items.len > 0) {
+            f.ip = f.tries.pop().?;
+            return;
+        }
+        return error.Thrown;
+    }
+
+    fn isThrowableClass(self: *Vm, name: []const u8) bool {
+        if (isBuiltinException(name)) return true;
+        return self.classExtends(name, "Exception") or self.classExtends(name, "Throwable");
+    }
+
+    /// Set pending exception of a builtin class and throw.
+    fn throwBuiltin(self: *Vm, line: u32, class_name: []const u8, msg: []const u8) Error!void {
+        self.pending_ex = try self.newBuiltinException(class_name, msg, line);
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        return self.throwInCurrentFrame(frame);
+    }
+
     fn invokeUser(self: *Vm, callee: *Func, args_base: u32, argc: u32, result_dst: u32, this_obj: ?*valmod.Object, line: u32) Error!void {
         if (self.frames.items.len >= MAX_CALL_DEPTH) {
             return self.fatalF(line, "Maximum function nesting level of {d} reached, aborting", .{MAX_CALL_DEPTH});
@@ -777,7 +965,19 @@ pub const Vm = struct {
             .hidden = try self.arena.alloc(Value, callee.nhidden),
             .result_reg = result_dst,
         });
-        try self.dispatch();
+        if (self.dispatch()) |_| {
+            return;
+        } else |e| switch (e) {
+            error.Thrown => {
+                _ = self.frames.pop();
+                if (self.unwindToRegion()) |handler_ip| {
+                    self.frames.items[self.frames.items.len - 1].ip = handler_ip;
+                    return;
+                }
+                return e;
+            },
+            else => return e,
+        }
     }
 
     /// True when class `name` is or inherits from `ancestor`.

@@ -164,6 +164,13 @@ pub const Parser = struct {
             .kw_foreach => return self.parseForeach(),
             .kw_function => return self.parseFunction(),
             .kw_class => return self.parseClassDecl(),
+            .kw_throw => {
+                _ = self.advance();
+                const e = try self.parseExpr();
+                _ = try self.expect(.semicolon);
+                return self.stmt(.{ .throw_stmt = e }, t.line);
+            },
+            .kw_try => return self.parseTry(),
             .kw_return => {
                 _ = self.advance();
                 var val: ?*ast.Expr = null;
@@ -741,6 +748,41 @@ pub const Parser = struct {
                 return self.fail("syntax error, unexpected end of file", .{});
             },
         }
+    }
+
+    fn parseTry(self: *Parser) Error!*ast.Stmt {
+        const t = self.advance(); // try
+        const body = try self.parseBody();
+
+        var catches: std.ArrayList(ast.Stmt.CatchClause) = .empty;
+        while (self.check(.kw_catch)) {
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            var types: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                const ct = try self.expect(.ident);
+                try types.append(self.arena, ct.text);
+                if (!self.accept(.pipe)) break;
+            }
+            const vt = try self.expect(.variable);
+            _ = try self.expect(.rparen);
+            const cbody = try self.parseBody();
+            try catches.append(self.arena, .{
+                .types = try types.toOwnedSlice(self.arena),
+                .var_name = vt.text[1..],
+                .body = cbody,
+            });
+        }
+        if (catches.items.len == 0) {
+            if (self.check(.ident) and std.mem.eql(u8, self.cur().text, "finally")) {
+                return self.fail("finally is not supported", .{});
+            }
+            return self.fail("try statement must have at least one catch block", .{});
+        }
+        return self.stmt(.{ .try_stmt = .{
+            .body = body,
+            .catches = try catches.toOwnedSlice(self.arena),
+        } }, t.line);
     }
 
     /// class Name extends Base { props & methods }

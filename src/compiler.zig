@@ -394,6 +394,11 @@ pub const Compiler = struct {
         self.chunk.code.items[addr].b = @intCast(self.chunk.code.items.len);
     }
 
+    /// Patch a jump's .b to an explicit address.
+    fn patchBAt(self: *Compiler, addr: usize, target: usize) Error!void {
+        self.chunk.code.items[addr].b = @intCast(target);
+    }
+
     fn here(self: *Compiler) usize {
         return self.chunk.code.items.len;
     }
@@ -552,6 +557,66 @@ pub const Compiler = struct {
                 // registered at VM startup and this is an idempotent no-op.
                 const k = try self.nameConst(cd.name);
                 _ = try self.emit1(.declare_class, k, line);
+            },
+
+            .throw_stmt => |e| {
+                const tv = try self.exprToTemp(e);
+                _ = try self.emit2(.throw_v, 0, tv.reg, line);
+                tv.release(&self.ctx);
+            },
+
+            .try_stmt => |ts| {
+                // Layout:
+                //   try_start   (inline-patched .a = handler address)
+                //   body...
+                //   try_end
+                //   jmp END
+                // HANDLER:
+                //   for each clause: catch_match / jmp_if_false next;
+                //                    fallthrough => clause body
+                //   rethrow
+                // CLAUSE_i: catch_store slot_i; body_i; jmp END
+                const start = self.here();
+                _ = try self.emit1(.try_start, 0, line);
+                try self.compileBody(ts.body);
+                _ = try self.emit1(.try_end, 0, line);
+
+                var end_jumps: std.ArrayList(usize) = .empty;
+                try end_jumps.append(self.arena, try self.emit1(.jmp, 0, line));
+
+                const handler_pos = self.here();
+                self.chunk.code.items[start].a = @intCast(handler_pos);
+
+                // Deferred patch targets: clause i's mismatch jump goes to
+                // clause i+1's check (or the rethrow for the last one).
+                var check_starts: std.ArrayList(usize) = .empty;
+                var mismatch_jumps: std.ArrayList(usize) = .empty;
+                for (ts.catches) |cl| {
+                    try check_starts.append(self.arena, self.here());
+                    const slot = try self.ctx.resolveLocal(self.arena, cl.var_name);
+                    self.ctx.markDefined(slot);
+                    const mr = self.ctx.alloc();
+                    const types_ix: u32 = @intCast(self.chunk.catch_types.items.len);
+                    try self.chunk.catch_types.append(self.arena, cl.types);
+                    _ = try self.emit3(.catch_match, mr, 0, types_ix, line);
+                    try mismatch_jumps.append(self.arena, try self.emit2(.jmp_if_false, mr, 0, line));
+                    self.ctx.freeReg(mr);
+                    _ = try self.emit2(.catch_store, @intCast(slot), 0, line);
+                    try self.compileBody(cl.body);
+                    try end_jumps.append(self.arena, try self.emit1(.jmp, 0, line));
+                }
+                const rethrow_pos = self.here();
+                _ = try self.emit1(.rethrow, 0, line);
+                for (mismatch_jumps.items, 0..) |j, i| {
+                    const target = if (i + 1 < check_starts.items.len)
+                        check_starts.items[i + 1]
+                    else
+                        rethrow_pos;
+                    try self.patchBAt(j, target);
+                }
+
+                const end_pos = self.here();
+                for (end_jumps.items) |j| self.chunk.code.items[j].a = @intCast(end_pos);
             },
 
             .ret => |maybe_e| {

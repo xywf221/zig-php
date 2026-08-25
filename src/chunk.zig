@@ -23,6 +23,8 @@ pub const Chunk = struct {
     /// rare and fall back to a short linear scan.
     int_ix: std.AutoHashMapUnmanaged(i64, u32) = .empty,
     str_ix: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Catch clause type lists, indexed by catch_match's c operand.
+    catch_types: std.ArrayList([]const []const u8) = .empty,
 
     pub fn emit(self: *Chunk, a: std.mem.Allocator, ins: Instr, line: u32) !usize {
         try self.code.append(a, ins);

@@ -163,6 +163,9 @@ pub const Stmt = struct {
         foreach: Foreach,
         func_decl: FuncDecl,
         class_decl: ClassDecl,
+        /// `throw <expr>;`
+        throw_stmt: *Expr,
+        try_stmt: Try,
         ret: ?*Expr,
         brk: u32,
         cont: u32,
@@ -215,5 +218,18 @@ pub const Stmt = struct {
         extends: ?[]const u8,
         props: []const PropDecl,
         methods: []const FuncDecl,
+    };
+
+    pub const CatchClause = struct {
+        /// Exception class names (A | B | C).
+        types: []const []const u8,
+        /// Variable name without '$' that receives the exception.
+        var_name: []const u8,
+        body: *Stmt,
+    };
+
+    pub const Try = struct {
+        body: *Stmt,
+        catches: []const CatchClause,
     };
 };
