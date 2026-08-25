@@ -31,13 +31,16 @@ $ zphp fib.php
 - 运算符：算术、比较、逻辑（短路）、位运算、`??`、`?:`、`<=>`、`**`、
   复合赋值、前后置 `++/--`
 - 错误处理：解析/编译错误带行号报告；运行期 Fatal Error 对齐 PHP 行为
+- 标准库内置函数 45+：string（strlen/substr/sprintf/str_replace…）、
+  array（count/implode/explode/array_*…）、math（abs/max/pow…）、
+  类型与检查（intval/gettype/is_*…）、输出（var_dump/print_r，格式与 PHP 逐字节一致）
 
 ## 明确不支持（PHP 8.0+ 目标之外）
 
 - 面向对象（class/interface/trait）、引用（`&$var`）
 - 旧语法：`array()` 字面量（用 `[...]`）、未定义常量降级为字符串（PHP 8 中本就是 Error）
 - 生成器、闭包、命名参数、属性注解、heredoc/nowdoc
-- 标准库内置函数（扩展点已预留于 `src/builtins.zig`）
+- 警告系统（undefined variable / non-numeric operand 静默处理，PHP 会发 Warning）
 
 ## 构建
 
@@ -116,7 +119,7 @@ vm.zig             栈式字节码虚拟机：共享操作数栈 + 每帧局部 
    ├── opcode.zig    指令集定义与操作数打包
    ├── chunk.zig     字节块：指令流 / 常量池 / 行号表 / 函数单元
    ├── value.zig     动态值 + PHP 类型语义（truthy / looseCmp / 强制转换）
-   └── builtins.zig  内置函数扩展点（当前为空，待填充标准库）
+   └── builtins.zig  内置函数标准库（~45 个，挂在 VM 上）
 ```
 
 内存策略：整次脚本运行使用一个 ArenaAllocator，运行结束统一释放——
@@ -125,11 +128,11 @@ vm.zig             栈式字节码虚拟机：共享操作数栈 + 每帧局部 
 ## 路线图
 
 - [x] 字节码编译 + 栈式 VM
-- [ ] 内置函数标准库（string/array/math）
-- [ ] 顶层变量局部提升（缩小循环性能差距）
+- [x] 内置函数标准库（string/array/math/type/output）
+- [ ] 指令融合（缩小循环性能差距）
 - [ ] 引用语义 `&`
 - [ ] OOP 子集
-- [ ] PHP 对齐的 float 格式化与警告系统
+- [ ] 警告系统与 PHP 对齐的 float 科学计数法格式
 
 ## License
 
