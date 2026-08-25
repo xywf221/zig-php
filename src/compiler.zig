@@ -35,6 +35,33 @@ pub const Program = struct {
     /// Functions declared unconditionally at the top level — hoisted at VM
     /// startup. Conditional declarations register via declare_func instead.
     hoisted: std.StringHashMapUnmanaged(void) = .empty,
+    classes: std.StringHashMapUnmanaged(*ClassInfo) = .empty,
+    hoisted_classes: std.StringHashMapUnmanaged(void) = .empty,
+};
+
+/// One property in a class's flattened layout (parent props first).
+pub const ClassProp = struct {
+    name: []const u8,
+    default: valmod.Value,
+};
+
+pub const ClassInfo = struct {
+    name: []const u8,
+    parent_name: ?[]const u8 = null,
+    /// Resolved at VM startup.
+    parent: ?*ClassInfo = null,
+    /// Own properties as declared; VM flattens with parent layout on use.
+    own_props: []const ClassProp = &.{},
+    methods: std.StringHashMapUnmanaged(*Func) = .empty,
+
+    /// Walk the chain looking for a method (child overrides parent).
+    pub fn findMethod(self: *ClassInfo, name: []const u8) ?*Func {
+        var c: ?*ClassInfo = self;
+        while (c) |cls| : (c = cls.parent) {
+            if (cls.methods.get(name)) |f| return f;
+        }
+        return null;
+    }
 };
 
 pub const Compiler = struct {
@@ -206,6 +233,13 @@ pub const Compiler = struct {
             },
             .isset => |exprs| for (exprs) |x| try reserveLocalsExpr(arena, x, ctx),
             .empty => |x| try reserveLocalsExpr(arena, x, ctx),
+            .new => |n| for (n.args) |arg| try reserveLocalsExpr(arena, arg, ctx),
+            .prop_get => |p| try reserveLocalsExpr(arena, p.obj, ctx),
+            .method_call => |m| {
+                try reserveLocalsExpr(arena, m.obj, ctx);
+                for (m.args) |arg| try reserveLocalsExpr(arena, arg, ctx);
+            },
+            .instanceof => |io| try reserveLocalsExpr(arena, io.operand, ctx),
             else => {}, // literals contain no variables
         }
     }
@@ -243,9 +277,16 @@ pub const Compiler = struct {
     /// are marked hoisted.
     fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag, hoist: bool) Error!void {
         switch (st.kind) {
+            .class_decl => |cd| {
+                if (!program.classes.contains(cd.name)) { // first wins
+                    const info = try compileClassUnit(arena, cd, diag);
+                    try program.classes.put(arena, cd.name, info);
+                }
+                if (hoist) try program.hoisted_classes.put(arena, cd.name, {});
+            },
             .func_decl => |fd| {
                 if (!program.funcs.contains(fd.name)) { // first wins
-                    const f = try compileFuncUnit(arena, fd, diag);
+                    const f = try compileFuncUnit(arena, fd, diag, false);
                     try program.funcs.put(arena, fd.name, f);
                 }
                 if (hoist) try program.hoisted.put(arena, fd.name, {});
@@ -264,19 +305,36 @@ pub const Compiler = struct {
         }
     }
 
-    fn compileFuncUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag) Error!*Func {
+    fn compileClassUnit(arena: std.mem.Allocator, cd: ast.Stmt.ClassDecl, diag: *Diag) Error!*ClassInfo {
+        const info = try arena.create(ClassInfo);
+        info.* = .{ .name = cd.name, .parent_name = cd.extends };
+        const props = try arena.alloc(ClassProp, cd.props.len);
+        for (cd.props, 0..) |p, i| {
+            props[i] = .{ .name = p.name, .default = p.default orelse valmod.Value.null_ };
+        }
+        info.own_props = props;
+        for (cd.methods) |m| {
+            if (info.methods.contains(m.name)) continue; // first wins
+            const f = try compileFuncUnit(arena, m, diag, true);
+            try info.methods.put(arena, m.name, f);
+        }
+        return info;
+    }
+
+    fn compileFuncUnit(arena: std.mem.Allocator, fd: ast.Stmt.FuncDecl, diag: *Diag, implicit_this: bool) Error!*Func {
         const f = try arena.create(Func);
         f.* = .{
             .name = fd.name,
-            .arity = fd.params.len,
-            .defaults = try arena.alloc(?Value, fd.params.len),
+            .arity = fd.params.len + (if (implicit_this) @as(usize, 1) else 0),
+            .defaults = try arena.alloc(?Value, if (implicit_this) fd.params.len + 1 else fd.params.len),
         };
         for (f.defaults) |*d| d.* = null;
 
         // The minimal core supports constant default values only.
+        const param_base: usize = if (implicit_this) 1 else 0;
         for (fd.params, 0..) |p, i| {
             if (p.default) |de| {
-                f.defaults[i] = constEval(de) orelse {
+                f.defaults[param_base + i] = constEval(de) orelse {
                     diag.msg = try std.fmt.allocPrint(arena, "unsupported default parameter expression in {s}() (compile-time constants only)", .{fd.name});
                     diag.line = de.line;
                     return error.SyntaxError;
@@ -286,6 +344,10 @@ pub const Compiler = struct {
 
         var ctx = FnCtx{ .func = f, .arena = arena };
         // Parameters occupy the first registers.
+        if (implicit_this) {
+            const tslot = try ctx.resolveLocal(arena, "this");
+            ctx.markDefined(tslot);
+        }
         for (fd.params) |p| {
             const pslot = try ctx.resolveLocal(arena, p.name);
             ctx.markDefined(pslot); // parameters are always defined
@@ -483,6 +545,13 @@ pub const Compiler = struct {
             .func_decl => |fd| {
                 const k = try self.nameConst(fd.name);
                 _ = try self.emit1(.declare_func, k, line);
+            },
+
+            .class_decl => |cd| {
+                // Conditional declaration point; hoisted classes were already
+                // registered at VM startup and this is an idempotent no-op.
+                const k = try self.nameConst(cd.name);
+                _ = try self.emit1(.declare_class, k, line);
             },
 
             .ret => |maybe_e| {
@@ -816,6 +885,47 @@ pub const Compiler = struct {
                 tb.release(&self.ctx);
             },
 
+            .new => |n| {
+                // Convention: regs[base] = instance slot, args at base+1..
+                const n2 = n.args.len + 1;
+                const base = self.ctx.allocBlock(n2);
+                for (n.args, 0..) |ae, i| try self.compileInto(base + 1 + @as(u32, @intCast(i)), ae);
+                const k = try self.nameConst(n.class_name);
+                _ = try self.emit3(.new_obj, @intCast(n.args.len), base, k, line);
+                if (dst != base) _ = try self.emit2(.mov, dst, base, line);
+                self.ctx.freeBlock(base, n2);
+            },
+
+            .prop_get => |pg| {
+                const to = try self.exprToReg(pg.obj, line);
+                const k = try self.nameConst(pg.name);
+                _ = try self.emit3(.get_prop, dst, to.reg, k, line);
+                to.release(&self.ctx);
+            },
+
+            .method_call => |mc| {
+                // Convention: regs[base] = instance (becomes $this),
+                // regs[base+1..] = declared arguments.
+                const n2 = mc.args.len + 1;
+                const base = self.ctx.allocBlock(n2);
+                const to = try self.exprToReg(mc.obj, line);
+                _ = try self.emit2(.mov, base, to.reg, line);
+                to.release(&self.ctx);
+                for (mc.args, 0..) |ae, i| try self.compileInto(base + 1 + @as(u32, @intCast(i)), ae);
+                const k = try self.nameConst(mc.name);
+                _ = try self.emit3(.call_method, @intCast(mc.args.len), base, k, line);
+                // Result overwrites regs[base].
+                if (dst != base) _ = try self.emit2(.mov, dst, base, line);
+                self.ctx.freeBlock(base, n2);
+            },
+
+            .instanceof => |io| {
+                const t = try self.exprToTemp(io.operand);
+                const k = try self.nameConst(io.class_name);
+                _ = try self.emit3(.instanceof, dst, t.reg, k, line);
+                t.release(&self.ctx);
+            },
+
             .isset => |exprs| {
                 try self.compileIssetOne(dst, exprs[0], line);
                 for (exprs[1..]) |x| {
@@ -958,6 +1068,30 @@ pub const Compiler = struct {
                 self.ctx.freeReg(parent);
             },
 
+            .prop_get => |pg| {
+                const to = try self.exprToTemp(pg.obj);
+                const k = try self.nameConst(pg.name);
+                switch (a.op) {
+                    .assign => {
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(.set_prop, to.reg, k, tv.reg, line);
+                        if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                        tv.release(&self.ctx);
+                    },
+                    else => {
+                        const told = self.ctx.alloc();
+                        _ = try self.emit3(.get_prop, told, to.reg, k, line);
+                        const tv = try self.exprToTemp(a.value);
+                        _ = try self.emit3(binOpOf(compoundBinOp(a.op)), tv.reg, told, tv.reg, line);
+                        _ = try self.emit3(.set_prop, to.reg, k, tv.reg, line);
+                        if (dst != tv.reg) _ = try self.emit2(.mov, dst, tv.reg, line);
+                        self.ctx.freeReg(tv.reg);
+                        self.ctx.freeReg(told);
+                    },
+                }
+                to.release(&self.ctx);
+            },
+
             else => return self.fail(line, "invalid assignment target", .{}),
         }
     }
@@ -995,6 +1129,20 @@ pub const Compiler = struct {
                 }
                 self.ctx.freeReg(tk.reg);
                 self.ctx.freeReg(parent);
+            },
+            .prop_get => |pg| {
+                const to = try self.exprToTemp(pg.obj);
+                const k = try self.nameConst(pg.name);
+                if (postfix) {
+                    // dst = old value
+                    const op: Op = if (up) .prop_post_inc else .prop_post_dec;
+                    _ = try self.emit3(op, dst, to.reg, k, line);
+                } else {
+                    // dst = new value
+                    const op: Op = if (up) .prop_pre_inc else .prop_pre_dec;
+                    _ = try self.emit3(op, dst, to.reg, k, line);
+                }
+                to.release(&self.ctx);
             },
             else => return self.fail(line, "invalid increment/decrement target", .{}),
         }

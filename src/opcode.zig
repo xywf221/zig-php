@@ -73,6 +73,25 @@ pub const Op = enum(u8) {
     /// a = (b !== null) ? b : c
     coalesce,
 
+    // -- objects ------------------------------------------------------------------
+    /// a = new consts[c](regs[b..b+a]) ; runs __construct when defined
+    new_obj,
+    /// a = regs[b]->consts[c]
+    get_prop,
+    /// regs[a]->consts[b] = regs[c]
+    set_prop,
+    /// a = regs[b] (instance at b, args b+1..) .consts[c]()
+    call_method,
+    /// a = (regs[b] instanceof consts[c])
+    instanceof,
+    /// register class consts[a] (conditional declarations)
+    declare_class,
+    /// property inc/dec: pre forms write new value to a; post write old
+    prop_pre_inc,
+    prop_pre_dec,
+    prop_post_inc,
+    prop_post_dec,
+
     // -- strings / output ----------------------------------------------------------------------
     strconcat, // a = join(regs[b] .. regs[b+c-1]) stringified
     echo, // print regs[a] .. regs[a+b-1]

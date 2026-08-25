@@ -37,6 +37,14 @@ pub const Kind = enum {
     kw_array,
     kw_isset,
     kw_empty,
+    kw_class,
+    kw_extends,
+    kw_public,
+    kw_private,
+    kw_protected,
+    kw_new,
+    kw_this,
+    kw_instanceof,
 
     // Punctuation
     lparen, // (
@@ -124,6 +132,14 @@ pub const keywords = std.StaticStringMap(Kind).initComptime(.{
     .{ "array", .kw_array },
     .{ "isset", .kw_isset },
     .{ "empty", .kw_empty },
+    .{ "class", .kw_class },
+    .{ "extends", .kw_extends },
+    .{ "public", .kw_public },
+    .{ "private", .kw_private },
+    .{ "protected", .kw_protected },
+    .{ "new", .kw_new },
+    .{ "this", .kw_this },
+    .{ "instanceof", .kw_instanceof },
 });
 
 pub const Token = struct {

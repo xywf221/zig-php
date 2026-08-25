@@ -190,6 +190,35 @@ test "array hash index: mixed keys round-trip" {
 }
 
 // ===========================================================================
+// Objects & classes
+// ===========================================================================
+
+test "class basics: props, constructor, methods, this" {
+    try expectOut("class P { public $x = 0; " ++
+        "function __construct($x) { $this->x = $x; } " ++
+        "function doubled() { return $this->x * 2; } } " ++
+        "$p = new P(12); echo $p->doubled();", "24");
+}
+
+test "inheritance: override + parent defaults + instanceof" {
+    try expectOut("class A { public $v = 10; function who() { return 'A'; } } " ++
+        "class B extends A { function who() { return 'B'; } } " ++
+        "$b = new B(); echo $b->who(), $b->v, get_class($b), $b instanceof A ? 1 : 0;", "B10B1");
+}
+
+test "object identity and property mutation" {
+    try expectOut("class C { public $n = 1; } " ++
+        "$a = new C(); $b = $a; $b->n = 7; " ++
+        "echo $a->n, ($a === $b) ? 1 : 0, ($a == $b) ? 1 : 0;", "711"); // PHP objects are handles: aliasing + identity
+}
+
+test "compound ops on properties and dynamic props" {
+    try expectOut("class C { public $c = 0; } " ++
+        "$o = new C(); $o->c += 5; $o->c *= 2; $o->extra = 'hi'; " ++
+        "echo $o->c, $o->extra;", "10hi");
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 

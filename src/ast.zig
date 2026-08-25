@@ -4,6 +4,7 @@
 //! the source line it started on for diagnostics.
 
 const std = @import("std");
+const valmod = @import("value.zig");
 
 pub const BinOp = enum {
     add, // +
@@ -127,6 +128,14 @@ pub const Expr = struct {
         index: struct { base: *Expr, index: ?*Expr },
         isset: []const *Expr,
         empty: *Expr,
+        /// `new ClassName(args)`
+        new: struct { class_name: []const u8, args: []const *Expr },
+        /// `$obj->prop`
+        prop_get: struct { obj: *Expr, name: []const u8 },
+        /// `$obj->method(args)`
+        method_call: struct { obj: *Expr, name: []const u8, args: []const *Expr },
+        /// `expr instanceof ClassName`
+        instanceof: struct { operand: *Expr, class_name: []const u8 },
     };
 
     pub const Elem = struct { key: ?*Expr, val: *Expr };
@@ -134,7 +143,7 @@ pub const Expr = struct {
 
     pub fn isLvalue(self: *const Expr) bool {
         return switch (self.kind) {
-            .var_ref, .index => true,
+            .var_ref, .index, .prop_get => true,
             else => false,
         };
     }
@@ -153,6 +162,7 @@ pub const Stmt = struct {
         for_stmt: For,
         foreach: Foreach,
         func_decl: FuncDecl,
+        class_decl: ClassDecl,
         ret: ?*Expr,
         brk: u32,
         cont: u32,
@@ -191,5 +201,19 @@ pub const Stmt = struct {
         /// Parameter name without '$'.
         name: []const u8,
         default: ?*Expr,
+    };
+
+    pub const PropDecl = struct {
+        /// Property name without '$'.
+        name: []const u8,
+        /// Constant default (literal / constant-foldable); null = unset.
+        default: ?valmod.Value,
+    };
+
+    pub const ClassDecl = struct {
+        name: []const u8,
+        extends: ?[]const u8,
+        props: []const PropDecl,
+        methods: []const FuncDecl,
     };
 };

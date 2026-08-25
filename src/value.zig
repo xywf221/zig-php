@@ -56,6 +56,40 @@ pub const Rope = struct {
     }
 };
 
+/// A class instance. Property lookup is linear over declared properties
+/// (classes in this subset are small); identity is pointer equality.
+pub const Object = struct {
+    class_name: []const u8,
+    props: std.ArrayList(ObjProp) = .empty,
+
+    pub const ObjProp = struct { name: []const u8, val: Value };
+
+    pub fn create(a: std.mem.Allocator, class_name: []const u8) !*Object {
+        const o = try a.create(Object);
+        o.* = .{ .class_name = class_name };
+        return o;
+    }
+
+    pub fn get(self: *const Object, name: []const u8) ?Value {
+        for (self.props.items) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p.val;
+        }
+        return null;
+    }
+
+    /// PHP: reading an undeclared property is a warning + null (we return
+    /// null); WRITING an undeclared property creates it dynamically.
+    pub fn set(self: *Object, a: std.mem.Allocator, name: []const u8, val: Value) !void {
+        for (self.props.items) |*p| {
+            if (std.mem.eql(u8, p.name, name)) {
+                p.val = val;
+                return;
+            }
+        }
+        try self.props.append(a, .{ .name = name, .val = val });
+    }
+};
+
 pub const Key = union(enum) {
     int: i64,
     str: []const u8,
@@ -91,6 +125,7 @@ pub const Value = union(enum) {
     /// (O(total length)) the first time raw bytes are needed.
     rope_: *const Rope,
     array_: *Array,
+    obj_: *Object,
 
     pub const Array = struct {
         entries: std.ArrayList(Entry) = .empty,
@@ -178,6 +213,7 @@ pub const Value = union(enum) {
             .float_ => "float",
             .str_, .rope_ => "string",
             .array_ => "array",
+            .obj_ => "object",
         };
     }
 
@@ -191,6 +227,7 @@ pub const Value = union(enum) {
             // Zero-allocation: only a single "0" byte is falsy.
             .rope_ => |r| r.len > 0 and !(r.len == 1 and firstByte(r) == '0'),
             .array_ => |arr| arr.count() > 0,
+            .obj_ => true,
         };
     }
 
@@ -214,6 +251,9 @@ pub fn toString(v: Value, a: std.mem.Allocator) ![]const u8 {
         .str_ => |s| s,
         .rope_ => |r| r.flatten(a),
         .array_ => "Array",
+        // Callers that need PHP's fatal-object-conversion semantics must
+        // reject objects before calling; this fallback keeps toString total.
+        .obj_ => "Object",
     };
 }
 
@@ -241,7 +281,7 @@ pub fn makeKey(v: Value, a: std.mem.Allocator) !Key {
             break :blk .{ .str = s };
         },
         .rope_ => |r| try makeKey(.{ .str_ = try r.flatten(a) }, a),
-        .array_ => fatalKey(),
+        .array_, .obj_ => fatalKey(),
     };
 }
 
@@ -359,7 +399,7 @@ pub fn toNumber(v: Value, mem: std.mem.Allocator) Number {
             const s = toString(v, mem) catch break :blk .{ .int = 0 };
             break :blk leadingNumber(s);
         },
-        .array_ => .{ .int = 0 }, // callers must reject arrays beforehand
+        .array_, .obj_ => .{ .int = 0 }, // callers must reject arrays/objects beforehand
     };
 }
 
@@ -464,16 +504,36 @@ pub fn looseCmp(a_in: Value, b_in: Value, mem: std.mem.Allocator) !std.math.Orde
     if (a == .array_) return .gt;
     if (b == .array_) return .lt;
 
+    // Objects: loose equality compares class + properties (PHP 8 rule);
+    // ordering falls back to class-name comparison (documented deviation).
+    if (a == .obj_ and b == .obj_) {
+        const oa = a.obj_;
+        const ob = b.obj_;
+        if (!std.mem.eql(u8, oa.class_name, ob.class_name)) {
+            return strcmpOrder(oa.class_name, ob.class_name);
+        }
+        if (oa.props.items.len != ob.props.items.len) {
+            return std.math.order(oa.props.items.len, ob.props.items.len);
+        }
+        for (oa.props.items, ob.props.items) |pa, pb| {
+            if (!std.mem.eql(u8, pa.name, pb.name)) return .gt;
+            if (!(try looseEq(pa.val, pb.val, mem))) return .gt;
+        }
+        return .eq;
+    }
+    if (a == .obj_) return .gt;
+    if (b == .obj_) return .lt;
+
     unreachable;
 }
 
-pub fn looseEq(a: Value, b: Value, mem: std.mem.Allocator) !bool {
+pub fn looseEq(a: Value, b: Value, mem: std.mem.Allocator) std.mem.Allocator.Error!bool {
     if (a == .int_ and b == .int_) return a.int_ == b.int_;
     return (try looseCmp(a, b, mem)) == .eq;
 }
 
 /// Strict equality (`===`). Arrays compare deeply and order-sensitively.
-pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) !bool {
+pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) std.mem.Allocator.Error!bool {
     var a = a_in;
     var b = b_in;
     // Ropes are an internal representation; compare as strings.
@@ -488,6 +548,8 @@ pub fn strictEq(a_in: Value, b_in: Value, mem: std.mem.Allocator) !bool {
         const s = try toString(b, mem);
         b = .{ .str_ = s };
     }
+    // PHP object identity: === compares instance pointers.
+    if (a == .obj_ or b == .obj_) return a == .obj_ and b == .obj_ and a.obj_ == b.obj_;
     if (@as(std.meta.Tag(Value), a) != @as(std.meta.Tag(Value), b)) return false;
     return switch (a) {
         .null_ => true,
@@ -511,7 +573,7 @@ fn arraysStrictEq(x: *Value.Array, y: *Value.Array, mem: std.mem.Allocator) std.
     for (x.entries.items, y.entries.items) |ex, ey| {
         if (!ex.key.eql(ey.key)) return false;
         if (!keyTagsMatch(ex.key, ey.key)) return false;
-        if (!try strictEq(ex.val, ey.val, mem)) return false;
+        if (!(strictEq(ex.val, ey.val, mem) catch false)) return false;
     }
     return true;
 }

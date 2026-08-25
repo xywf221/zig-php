@@ -45,6 +45,7 @@ const table = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "array_values", &fn_array_values },
     .{ "array_reverse", &fn_array_reverse },
     .{ "array_sum", &fn_array_sum },
+    .{ "get_class", &fn_get_class },
     .{ "array_merge", &fn_array_merge },
     .{ "in_array", &fn_in_array },
     .{ "implode", &fn_implode },
@@ -300,6 +301,12 @@ fn fn_sprintf(in: *Vm, args: []const Value) Error!Value {
 }
 
 // -- arrays ------------------------------------------------------------------------
+
+fn fn_get_class(in: *Vm, args: []const Value) Error!Value {
+    _ = in;
+    if (args.len == 1 and args[0] == .obj_) return .{ .str_ = args[0].obj_.class_name };
+    return .{ .bool_ = false }; // simplified: no class-scope form
+}
 
 fn fn_count(in: *Vm, args: []const Value) Error!Value {
     try needArgs(in, args, 1, 1, "count($value)");
@@ -649,6 +656,7 @@ fn fn_gettype(in: *Vm, args: []const Value) Error!Value {
         .float_ => "double",
         .str_, .rope_ => "string",
         .array_ => "array",
+        .obj_ => "object",
     } };
 }
 
@@ -665,6 +673,14 @@ fn dumpValue(in: *Vm, v: Value, indent: u32) Error!void {
         .str_, .rope_ => {
             const st = try valmod.toString(v, in.arena);
             try in.out.print("{s}string({d}) \"{s}\"\n", .{ pad, st.len, st });
+        },
+        .obj_ => |o| {
+            try in.out.print("{s}object({s}) {{\n", .{ pad, o.class_name });
+            for (o.props.items) |p| {
+                try in.out.print("{s}  [\"{s}\"]=>\n", .{ pad, p.name });
+                try dumpValue(in, p.val, indent + 2);
+            }
+            try in.out.print("{s}}}\n", .{pad});
         },
         .array_ => {
             const arr = v.array_;

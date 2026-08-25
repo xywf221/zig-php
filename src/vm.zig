@@ -36,6 +36,8 @@ pub const Vm = struct {
     /// Functions registered so far (conditional declarations register when
     /// execution reaches them).
     funcs: std.StringHashMapUnmanaged(*Func) = .empty,
+    /// Classes whose declaration statement has executed.
+    declared_classes: std.StringHashMapUnmanaged(void) = .empty,
 
     frames: std.ArrayList(Frame) = .empty,
     /// Pooled register files for call frames (bounded recycling).
@@ -65,6 +67,16 @@ pub const Vm = struct {
             if (program.funcs.get(key.*)) |f| {
                 vm.funcs.put(arena, key.*, f) catch {};
             }
+        }
+        var cit = program.hoisted_classes.keyIterator();
+        while (cit.next()) |key| {
+            vm.declared_classes.put(arena, key.*, {}) catch {};
+        }
+        // Resolve parent links (all classes are compiled by now).
+        var pit = program.classes.iterator();
+        while (pit.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (info.parent_name) |pname| info.parent = program.classes.get(pname);
         }
         return vm;
     }
@@ -275,6 +287,93 @@ pub const Vm = struct {
                     regs[ins.a] = .{ .int_ = ~valmod.toNumber(regs[ins.b], self.arena).int };
                 },
                 .is_not_null => regs[ins.a] = .{ .bool_ = regs[ins.b] != .null_ },
+                .declare_class => {
+                    const name = consts[ins.a].str_;
+                    self.declared_classes.put(self.arena, name, {}) catch {};
+                },
+                .new_obj => {
+                    const cls_name = consts[ins.c].str_;
+                    if (!self.declared_classes.contains(cls_name)) {
+                        return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
+                    }
+                    const info = self.program.classes.get(cls_name) orelse
+                        return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
+                    const obj = try valmod.Object.create(self.arena, cls_name);
+                    // Flattened layout: parent props first.
+                    var chain_buf: [64]*compiler_mod.ClassInfo = undefined;
+                    var depth: usize = 0;
+                    var c: ?*compiler_mod.ClassInfo = info;
+                    while (c) |cl| : (c = cl.parent) {
+                        if (depth >= 64) return self.fatalF(line, "inheritance chain too deep", .{});
+                        chain_buf[depth] = cl;
+                        depth += 1;
+                    }
+                    var di: usize = depth;
+                    while (di > 0) {
+                        di -= 1;
+                        for (chain_buf[di].own_props) |p| {
+                            try obj.props.append(self.arena, .{ .name = p.name, .val = p.default });
+                        }
+                    }
+                    regs[ins.b] = .{ .obj_ = obj };
+                    if (info.findMethod("__construct")) |ctor| {
+                        // ctor(this, args...): instance at b, args at b+1..b+argc.
+                        // Result goes nowhere: the instance stays in regs[b].
+                        try self.invokeUser(ctor, ins.b + 1, ins.a, opcode.no_reg, obj, line);
+                    }
+                },
+                .get_prop => {
+                    const o = regs[ins.b];
+                    if (o != .obj_) return self.fatalF(line, "attempt to read property on {s}", .{o.typeName()});
+                    const name = consts[ins.c].str_;
+                    regs[ins.a] = o.obj_.get(name) orelse blk: {
+                        self.warn(line, "Undefined property: {s}::${s}", .{ o.obj_.class_name, name });
+                        break :blk .null_;
+                    };
+                },
+                .set_prop => {
+                    const o = regs[ins.a];
+                    if (o != .obj_) return self.fatalF(line, "attempt to assign property on {s}", .{o.typeName()});
+                    try o.obj_.set(self.arena, consts[ins.b].str_, regs[ins.c]);
+                },
+                .call_method => {
+                    const obj_val = f.regs[ins.b];
+                    if (obj_val != .obj_) return self.fatalF(line, "call to member function on {s}", .{obj_val.typeName()});
+                    const cls_name = obj_val.obj_.class_name;
+                    const info = self.program.classes.get(cls_name) orelse
+                        return self.fatalF(line, "Class \"{s}\" not found", .{cls_name});
+                    const mname = consts[ins.c].str_;
+                    const mf = info.findMethod(mname) orelse
+                        return self.fatalF(line, "Call to undefined method {s}::{s}()", .{ cls_name, mname });
+                    // mf(this at slot 0, params at 1..): instance in regs[b],
+                    // declared args at b+1..; result overwrites regs[b].
+                    try self.invokeUser(mf, ins.b + 1, ins.a, ins.b, obj_val.obj_, line);
+                },
+                .instanceof => {
+                    const o = regs[ins.b];
+                    const target = consts[ins.c].str_;
+                    regs[ins.a] = .{ .bool_ = o == .obj_ and self.classExtends(o.obj_.class_name, target) };
+                },
+                .prop_pre_inc, .prop_pre_dec => {
+                    const up = ins.op == .prop_pre_inc;
+                    const o = regs[ins.b];
+                    if (o != .obj_) return self.fatalF(line, "attempt to modify property on {s}", .{o.typeName()});
+                    const k = consts[ins.c].str_;
+                    const old = o.obj_.get(k) orelse .null_;
+                    const nv = incValue(old, up, self.arena);
+                    try o.obj_.set(self.arena, k, nv);
+                    regs[ins.a] = nv;
+                },
+                .prop_post_inc, .prop_post_dec => {
+                    const up = ins.op == .prop_post_inc;
+                    const o = regs[ins.b];
+                    if (o != .obj_) return self.fatalF(line, "attempt to modify property on {s}", .{o.typeName()});
+                    const k = consts[ins.c].str_;
+                    const old = o.obj_.get(k) orelse .null_;
+                    const nv = incValue(old, up, self.arena);
+                    try o.obj_.set(self.arena, k, nv);
+                    regs[ins.a] = old;
+                },
                 .warn_undef => {
                     const name = f.func.chunk.consts.items[ins.a].str_;
                     self.warn(line, "Undefined variable ${s}", .{name});
@@ -640,6 +739,59 @@ pub const Vm = struct {
         }
 
         return self.fatalF(line, "Call to undefined function {s}()", .{name});
+    }
+
+    /// Invoke a compiled method/function: `this_obj` lands in callee slot 0
+    /// (when non-null), declared args copy from caller regs[args_base..],
+    /// defaults fill the rest, and the return value is written back to
+    /// caller's result_dst register.
+    fn invokeUser(self: *Vm, callee: *Func, args_base: u32, argc: u32, result_dst: u32, this_obj: ?*valmod.Object, line: u32) Error!void {
+        if (self.frames.items.len >= MAX_CALL_DEPTH) {
+            return self.fatalF(line, "Maximum function nesting level of {d} reached, aborting", .{MAX_CALL_DEPTH});
+        }
+        const caller = &self.frames.items[self.frames.items.len - 1];
+        const callee_regs = try self.newFrameRegs(callee);
+        var dst_i: usize = 0;
+        if (this_obj) |o| {
+            callee_regs[0] = .{ .obj_ = o };
+            dst_i = 1;
+        }
+        for (0..argc) |i| {
+            if (dst_i + i >= callee_regs.len) break;
+            callee_regs[dst_i + i] = caller.regs[args_base + i];
+        }
+        const filled = dst_i + argc;
+        var i: usize = filled;
+        while (i < callee.arity) : (i += 1) {
+            if (i < callee.defaults.len) {
+                callee_regs[i] = callee.defaults[i] orelse
+                    return self.fatalF(line, "Too few arguments to {s}()", .{callee.name});
+            } else {
+                return self.fatalF(line, "Too few arguments to {s}()", .{callee.name});
+            }
+        }
+        try self.frames.append(self.arena, .{
+            .func = callee,
+            .ip = 0,
+            .regs = callee_regs,
+            .hidden = try self.arena.alloc(Value, callee.nhidden),
+            .result_reg = result_dst,
+        });
+        try self.dispatch();
+    }
+
+    /// True when class `name` is or inherits from `ancestor`.
+    fn classExtends(self: *Vm, name: []const u8, ancestor: []const u8) bool {
+        if (std.mem.eql(u8, name, ancestor)) return true;
+        var cur = self.program.classes.get(name);
+        while (cur) |cls| : (cur = cls.parent) {
+            if (cls.parent_name) |pn| {
+                if (std.mem.eql(u8, pn, ancestor)) return true;
+                cur = self.program.classes.get(pn); // continue from parent
+                if (cur == null) return false;
+            } else return false;
+        }
+        return false;
     }
 
     fn popFrame(self: *Vm, result: Value) Error!void {

@@ -12,6 +12,7 @@
 const std = @import("std");
 const tok = @import("token.zig");
 const ast = @import("ast.zig");
+const valmod = @import("value.zig");
 
 const Token = tok.Token;
 const Kind = tok.Kind;
@@ -162,6 +163,7 @@ pub const Parser = struct {
             },
             .kw_foreach => return self.parseForeach(),
             .kw_function => return self.parseFunction(),
+            .kw_class => return self.parseClassDecl(),
             .kw_return => {
                 _ = self.advance();
                 var val: ?*ast.Expr = null;
@@ -603,6 +605,23 @@ pub const Parser = struct {
                     _ = try self.expect(.rparen);
                     e = try self.expr(.{ .call = .{ .name = name, .args = args } }, line);
                 },
+                .object_op => {
+                    _ = self.advance();
+                    const name_tok = try self.expect(.ident);
+                    if (self.check(.lparen)) {
+                        _ = self.advance();
+                        const args = if (self.check(.rparen)) try self.arena.alloc(*ast.Expr, 0) else try self.parseExprList(.rparen);
+                        _ = try self.expect(.rparen);
+                        e = try self.expr(.{ .method_call = .{ .obj = e, .name = name_tok.text, .args = args } }, line);
+                    } else {
+                        e = try self.expr(.{ .prop_get = .{ .obj = e, .name = name_tok.text } }, line);
+                    }
+                },
+                .kw_instanceof => {
+                    _ = self.advance();
+                    const cls = try self.expect(.ident);
+                    e = try self.expr(.{ .instanceof = .{ .operand = e, .class_name = cls.text } }, line);
+                },
                 .incr, .decr => {
                     if (!e.isLvalue()) return self.fail("cannot increment/decrement this expression", .{});
                     const up = self.advance().kind == .incr;
@@ -668,7 +687,19 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.expr(.null_lit, t.line);
             },
-            .lparen => {
+            .kw_new => {
+            _ = self.advance();
+            const cls = try self.expect(.ident);
+            _ = try self.expect(.lparen);
+            const args = if (self.check(.rparen)) try self.arena.alloc(*ast.Expr, 0) else try self.parseExprList(.rparen);
+            _ = try self.expect(.rparen);
+            return self.expr(.{ .new = .{ .class_name = cls.text, .args = args } }, t.line);
+        },
+        .kw_this => {
+            _ = self.advance();
+            return self.expr(.{ .var_ref = "this" }, t.line);
+        },
+        .lparen => {
                 _ = self.advance();
                 const inner = try self.parseExpr();
                 _ = try self.expect(.rparen);
@@ -710,6 +741,76 @@ pub const Parser = struct {
                 return self.fail("syntax error, unexpected end of file", .{});
             },
         }
+    }
+
+    /// class Name extends Base { props & methods }
+    /// Visibility keywords are accepted and ignored (all members public).
+    fn parseClassDecl(self: *Parser) Error!*ast.Stmt {
+        const t = self.advance(); // class
+        const name_tok = try self.expect(.ident);
+        var extends: ?[]const u8 = null;
+        if (self.accept(.kw_extends)) {
+            extends = (try self.expect(.ident)).text;
+        }
+        _ = try self.expect(.lbrace);
+
+        var props: std.ArrayList(ast.Stmt.PropDecl) = .empty;
+        var methods: std.ArrayList(ast.Stmt.FuncDecl) = .empty;
+        while (!self.check(.rbrace)) {
+            if (self.accept(.kw_public) or self.accept(.kw_private) or self.accept(.kw_protected)) {
+                // visibility ignored
+            } else if (self.check(.ident) and std.mem.eql(u8, self.cur().text, "static")) {
+                return self.fail("static properties/methods are not supported", .{});
+            }
+            if (self.check(.kw_function)) {
+                const m = try self.parseFunction();
+                try methods.append(self.arena, m.kind.func_decl);
+            } else if (self.check(.variable)) {
+                const p = self.advance();
+                var default_val: ?valmod.Value = null;
+                if (self.accept(.assign)) {
+                    default_val = try self.parseConstDefault();
+                }
+                _ = try self.expect(.semicolon);
+                try props.append(self.arena, .{ .name = p.text[1..], .default = default_val });
+            } else {
+                return self.fail("unexpected '{s}' in class body", .{self.cur().text});
+            }
+        }
+        _ = try self.expect(.rbrace);
+        return self.stmt(.{ .class_decl = .{
+            .name = name_tok.text,
+            .extends = extends,
+            .props = try props.toOwnedSlice(self.arena),
+            .methods = try methods.toOwnedSlice(self.arena),
+        } }, t.line);
+    }
+
+    /// Property defaults accept literals only.
+    fn parseConstDefault(self: *Parser) Error!valmod.Value {
+        const t = self.advance();
+        return switch (t.kind) {
+            .int => .{ .int_ = try self.parseIntToken(t) },
+            .float => .{ .float_ = try self.parseFloatToken(t) },
+            .string => blk: {
+                if (t.single_quoted) {
+                    break :blk valmod.Value{ .str_ = try unescapeSingleQuoted(self.arena, t.text) };
+                }
+                break :blk valmod.Value{ .str_ = t.text }; // no interpolation in defaults
+            },
+            .kw_true => .{ .bool_ = true },
+            .kw_false => .{ .bool_ = false },
+            .kw_null => .null_,
+            .minus => {
+                const n = self.advance();
+                switch (n.kind) {
+                    .int => return valmod.Value{ .int_ = -try self.parseIntToken(n) },
+                    .float => return valmod.Value{ .float_ = -try self.parseFloatToken(n) },
+                    else => return self.fail("unsupported property default", .{}),
+                }
+            },
+            else => return self.fail("property default must be a constant expression", .{}),
+        };
     }
 
     fn parseArrayItems(self: *Parser, end: Kind) Error![]const ast.Expr.Elem {
