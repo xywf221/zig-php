@@ -144,9 +144,11 @@ vm.zig             寄存器式字节码虚拟机：每帧平坦寄存器文件�
 - [x] OOP 子集（类/继承/构造器/属性/方法/instanceof）
 - [x] 异常：try/catch + Exception/Error 类层次
 - [x] 警告系统（stderr）
-- [ ] 引用语义 `&`
-- [ ] 接口 / trait / 静态成员
-- [ ] NaN-boxing 值表示（收窄每指令固定成本，见 BENCHMARKS.md Notes）
+- [x] 引用语义 `&`（共享 Cell，编译期槽位标记改写，非引用零开销）
+- [x] 接口 / trait / 静态成员（self::/parent::/static::、instanceof 传递）
+- [x] 16 字节紧凑值表示（字符串装箱为堆上头对象）
+- [x] float 科学计数法 + 非数值运算 TypeError（PHP 8 对齐）
+- [ ] baseline JIT（设计已冻结：docs/JIT_DESIGN.md）
 - [ ] 与 PHP 对齐的 float 科学计数法格式
 
 ## License
