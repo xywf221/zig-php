@@ -334,7 +334,16 @@ pub fn looseCmp(a: Value, b: Value, mem: std.mem.Allocator) !std.math.Order {
         return strcmpOrder(a.str_, try toString(b, mem));
     }
 
-    if (a == .str_ and b == .str_) return strcmpOrder(a.str_, b.str_);
+    if (a == .str_ and b == .str_) {
+        // PHP 8: two numeric strings compare numerically ("10" < "9" is
+        // false); otherwise byte-wise.
+        if (numericString(a.str_)) |na| {
+            if (numericString(b.str_)) |nb| {
+                return numOrder(na.toFloat(), nb.toFloat());
+            }
+        }
+        return strcmpOrder(a.str_, b.str_);
+    }
 
     // Arrays.
     if (a == .array_ and b == .array_) {

@@ -95,15 +95,29 @@ pub const Compiler = struct {
     }
 
     fn collectFuncs(arena: std.mem.Allocator, stmts: []const *ast.Stmt, program: *Program, diag: *Diag) Error!void {
-        for (stmts) |s| {
-            switch (s.kind) {
-                .func_decl => |fd| {
-                    if (program.funcs.contains(fd.name)) continue; // first wins
-                    const f = try compileFuncUnit(arena, fd, diag);
-                    try program.funcs.put(arena, fd.name, f);
-                },
-                else => {},
-            }
+        for (stmts) |s| try collectFuncsStmt(arena, s, program, diag);
+    }
+
+    /// Walk every statement tree — functions may be declared conditionally
+    /// or nested inside other functions.
+    fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag) Error!void {
+        switch (st.kind) {
+            .func_decl => |fd| {
+                if (program.funcs.contains(fd.name)) return; // first wins
+                const f = try compileFuncUnit(arena, fd, diag);
+                try program.funcs.put(arena, fd.name, f);
+                try collectFuncs(arena, fd.body, program, diag);
+            },
+            .block => |stmts| try collectFuncs(arena, stmts, program, diag),
+            .if_stmt => |info| {
+                for (info.branches) |b| try collectFuncsStmt(arena, b.body, program, diag);
+                if (info.else_body) |eb| try collectFuncsStmt(arena, eb, program, diag);
+            },
+            .while_stmt => |w| try collectFuncsStmt(arena, w.body, program, diag),
+            .do_while => |dw| try collectFuncsStmt(arena, dw.body, program, diag),
+            .for_stmt => |f| try collectFuncsStmt(arena, f.body, program, diag),
+            .foreach => |fe| try collectFuncsStmt(arena, fe.body, program, diag),
+            else => {},
         }
     }
 
@@ -114,6 +128,7 @@ pub const Compiler = struct {
             .arity = fd.params.len,
             .defaults = try arena.alloc(?Value, fd.params.len),
         };
+        for (f.defaults) |*d| d.* = null;
 
         // The minimal core supports constant default values only.
         for (fd.params, 0..) |p, i| {
@@ -420,6 +435,11 @@ pub const Compiler = struct {
                 try self.compileExpr(b.rhs);
                 _ = try self.emit(.coalesce, line);
             },
+            .logic_xor => {
+                try self.compileExpr(b.lhs);
+                try self.compileExpr(b.rhs);
+                _ = try self.emit(.logic_xor, line);
+            },
             else => {
                 try self.compileExpr(b.lhs);
                 try self.compileExpr(b.rhs);
@@ -459,14 +479,19 @@ pub const Compiler = struct {
                         .var_ref => |name| try self.pushVar(name, line),
                         .var_index => |vi| {
                             try self.pushVar(vi.name, line);
-                            if (vi.key_str) |ks| {
-                                const k = try self.chunk.addConst(self.arena, .{ .str_ = ks });
-                                _ = try self.emitArg(.const_k, k, line);
-                            } else {
-                                const k = try self.chunk.addConst(self.arena, .{ .int_ = vi.key_int });
-                                _ = try self.emitArg(.const_k, k, line);
+                            for (vi.keys) |key| {
+                                switch (key) {
+                                    .str => |ks| {
+                                        const k = try self.chunk.addConst(self.arena, .{ .str_ = ks });
+                                        _ = try self.emitArg(.const_k, k, line);
+                                    },
+                                    .int => |iv| {
+                                        const k = try self.chunk.addConst(self.arena, .{ .int_ = iv });
+                                        _ = try self.emitArg(.const_k, k, line);
+                                    },
+                                }
+                                _ = try self.emit(.get_index, line);
                             }
-                            _ = try self.emit(.get_index, line);
                         },
                     }
                     n += 1;
@@ -480,32 +505,22 @@ pub const Compiler = struct {
             },
 
             .array_lit => |items| {
-                var kv_count: usize = 0;
-                var plain_count: usize = 0;
+                // Build in source order so auto-key sequencing matches PHP:
+                // [9, 'k' => 2] gives 0=>9 then 'k'=>2.
+                _ = try self.emitArg(.new_array, 0, line);
                 for (items) |item| {
-                    if (item.key != null) kv_count += 1 else plain_count += 1;
-                }
-                // Emit keyed pairs first, then appends — this matches PHP's
-                // next-index behavior for mixed literals.
-                if (kv_count > 0) {
-                    // Keyed pairs first, then trailing plain appends —
-                    // matches PHP's next-index behavior for mixed literals.
-                    for (items) |item| {
-                        if (item.key) |ke| {
-                            try self.compileExpr(ke);
-                            try self.compileExpr(item.val);
-                        }
+                    _ = try self.emit(.dup, line); // keep the array under us
+                    if (item.key) |ke| {
+                        try self.compileExpr(ke);
+                        try self.compileExpr(item.val);
+                        _ = try self.emit(.set_index, line);
+                    } else {
+                        try self.compileExpr(item.val);
+                        _ = try self.emit(.append_index, line);
                     }
-                    _ = try self.emitArg(.new_array_kv, @intCast(kv_count), line);
-                    for (items) |item| {
-                        if (item.key == null) {
-                            try self.compileExpr(item.val);
-                            _ = try self.emit(.append_index, line);
-                        }
-                    }
-                } else {
-                    for (items) |item| try self.compileExpr(item.val);
-                    _ = try self.emitArg(.new_array, @intCast(items.len), line);
+                    // Both ops push the stored value for assignment
+                    // expressions; inside a literal only the array remains.
+                    _ = try self.emit(.pop, line);
                 }
             },
 

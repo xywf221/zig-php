@@ -10,6 +10,5 @@ comptime {
     _ = @import("interp.zig");
     _ = @import("test_lexer.zig");
     _ = @import("test_parser.zig");
+    _ = @import("tests_impl.zig");
 }
-
-pub const runCode = @import("tests_impl.zig").runCode;

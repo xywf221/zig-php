@@ -222,7 +222,8 @@ test "interpolation parts" {
     try t.expectEqualStrings(", v=", parts[2].literal);
     try t.expect(parts[3] == .var_index);
     try t.expectEqualStrings("v", parts[3].var_index.name);
-    try t.expectEqual(@as(i64, 0), parts[3].var_index.key_int);
+    try t.expectEqual(@as(usize, 1), parts[3].var_index.keys.len);
+    try t.expectEqual(@as(i64, 0), parts[3].var_index.keys[0].int);
     try t.expect(parts[4] == .literal);
     try t.expectEqualStrings("!", parts[4].literal);
 }

@@ -99,6 +99,8 @@ pub const Op = enum(u8) {
     jmp_if_true_raw,
     /// [a b] -> winner of `??` (a unless a === null, else b).
     coalesce,
+    /// Logical xor: pop 2, push bool(truthiness differs).
+    logic_xor,
 
     // -- strings / output --------------------------------------------------------------------------
     strconcat, // pop arg values, string-convert each, join, push

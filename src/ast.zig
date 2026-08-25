@@ -91,9 +91,15 @@ pub const StrPart = union(enum) {
     literal: []const u8,
     /// `$name` or `{$name}` interpolation.
     var_ref: []const u8,
-    /// `$name[key]` / `{$name[key]}` where key is an unquoted identifier
-    /// or a non-negative integer.
-    var_index: struct { name: []const u8, key_str: ?[]const u8, key_int: i64 },
+    /// `$name[key1][key2]...` / `{$name[key]}` chains where each key is an
+    /// unquoted identifier or a non-negative integer.
+    var_index: struct { name: []const u8, keys: []const IndexKey },
+};
+
+/// A key in an interpolated variable chain.
+pub const IndexKey = union(enum) {
+    str: []const u8,
+    int: i64,
 };
 
 pub const Expr = struct {

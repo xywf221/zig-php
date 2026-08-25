@@ -256,7 +256,8 @@ pub const Vm = struct {
                         .null_ => false,
                         .array_ => |arr| blk: {
                             if (key_v == .array_) break :blk false;
-                            break :blk arr.get(try valmod.makeKey(key_v, self.arena)) != null;
+                            const found = arr.get(try valmod.makeKey(key_v, self.arena)) orelse break :blk false;
+                            break :blk found != .null_;
                         },
                         .str_ => |st| key_v == .int_ and key_v.int_ >= 0 and key_v.int_ < st.len,
                         else => false,
@@ -382,6 +383,11 @@ pub const Vm = struct {
                     const rhs = self.pop();
                     const lhs = self.pop();
                     try self.push(if (lhs != .null_) lhs else rhs);
+                },
+                .logic_xor => {
+                    const r = self.pop().truthy();
+                    const l = self.pop().truthy();
+                    try self.push(.{ .bool_ = l != r });
                 },
 
                 .strconcat => {
@@ -565,6 +571,9 @@ pub const Vm = struct {
                 return arr.get(try valmod.makeKey(key_v, self.arena)) orelse .null_;
             },
             .str_ => |st| {
+                // Only numeric offsets index strings; anything else reads as
+                // "" (matching the reference engine; PHP warns).
+                if (key_v != .int_ and key_v != .float_) return .{ .str_ = "" };
                 const fl = valmod.toNumber(key_v).toFloat();
                 if (fl < 0 or fl >= @as(f64, @floatFromInt(st.len))) return .{ .str_ = "" };
                 const i: usize = @intFromFloat(fl);

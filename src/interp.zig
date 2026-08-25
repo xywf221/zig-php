@@ -212,7 +212,7 @@ pub const Interp = struct {
                             try buf.appendSlice(self.arena, try valmod.toString(v, self.arena));
                         },
                         .var_index => |vi| {
-                            const v = try self.readVarIndex(vi.name, vi.key_str, vi.key_int, e.line, env);
+                            const v = try self.readVarIndex(vi.name, vi.keys, e.line, env);
                             try buf.appendSlice(self.arena, try valmod.toString(v, self.arena));
                         },
                     }
@@ -290,24 +290,36 @@ pub const Interp = struct {
     fn readVarIndex(
         self: *Interp,
         name: []const u8,
-        key_str: ?[]const u8,
-        key_int: i64,
+        keys: []const ast.IndexKey,
         line: u32,
         env: *Env,
     ) Error!Value {
-        const base = env.get(name) orelse return .null_;
-        const idx_expr_holder = struct {};
-        _ = idx_expr_holder;
-        const key: valmod.Key = if (key_str) |ks|
-            .{ .str = ks }
-        else
-            .{ .int = key_int };
+        var base = env.get(name) orelse return .null_;
+        for (keys) |key| {
+            const kv: Value = switch (key) {
+                .str => |ks| .{ .str_ = ks },
+                .int => |iv| .{ .int_ = iv },
+            };
+            base = try self.indexReadValue(base, kv, line);
+        }
+        return base;
+    }
+
+    /// Shared index read used by both expression indexing and interpolation.
+    fn indexReadValue(self: *Interp, base: Value, key_v: Value, line: u32) Error!Value {
         switch (base) {
-            .array_ => |arr| return arr.get(key) orelse .null_,
-            .str_ => |s| {
-                if (key != .int or key.int < 0 or key.int >= s.len) return .{ .str_ = "" };
-                return .{ .str_ = s[@intCast(key.int)..@intCast(key.int + 1)] };
+            .array_ => |arr| {
+                if (key_v == .array_) return self.fatalF(line, "illegal offset type: array", .{});
+                return arr.get(try valmod.makeKey(key_v, self.arena)) orelse .null_;
             },
+            .str_ => |s| {
+                if (key_v != .int_ and key_v != .float_) return .{ .str_ = "" };
+                const i_f = valmod.toNumber(key_v).toFloat();
+                if (i_f < 0 or i_f >= @as(f64, @floatFromInt(s.len))) return .{ .str_ = "" };
+                const i: usize = @intFromFloat(i_f);
+                return .{ .str_ = s[i .. i + 1] };
+            },
+            .null_ => return .null_, // reading from null yields null
             else => return self.fatalF(line, "cannot use {s} value as array", .{base.typeName()}),
         }
     }
@@ -323,8 +335,10 @@ pub const Interp = struct {
             .str_ => |s| {
                 const ke = index orelse return self.fatalF(line, "cannot read from string without an index", .{});
                 const kv = try self.eval(ke, env);
-                const n = valmod.toNumber(kv);
-                const i_f = n.toFloat();
+                // Only numeric offsets index strings; anything else reads as
+                // "" (matching the VM; PHP warns).
+                if (kv != .int_ and kv != .float_) return .{ .str_ = "" };
+                const i_f = valmod.toNumber(kv).toFloat();
                 if (i_f < 0 or i_f >= @as(f64, @floatFromInt(s.len))) return .{ .str_ = "" };
                 const i: usize = @intFromFloat(i_f);
                 return .{ .str_ = s[i .. i + 1] };
@@ -712,7 +726,7 @@ pub const Interp = struct {
             } else if (param.default) |de| {
                 try local.put(self.arena, param.name, try self.eval(de, &local));
             } else {
-                return self.fatalF(line, "Too few arguments to function {s}(), missing '{s}'", .{ fd.name, param.name });
+                return self.fatalF(line, "Too few arguments to function {s}()", .{fd.name});
             }
         }
 

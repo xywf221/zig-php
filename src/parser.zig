@@ -800,6 +800,7 @@ fn splitInterpolated(arena: std.mem.Allocator, raw: []const u8) ![]ast.StrPart {
                 '\\' => try buf.append(arena, '\\'),
                 '$' => try buf.append(arena, '$'),
                 '"' => try buf.append(arena, '"'),
+                '{', '}' => try buf.append(arena, raw[i]), // \{ \} escape the brace
                 'x' => {
                     // \xHH
                     var v: u16 = 0;
@@ -821,93 +822,42 @@ fn splitInterpolated(arena: std.mem.Allocator, raw: []const u8) ![]ast.StrPart {
             continue;
         }
 
-        // {$name} and {$name[key]} brace form.
+        // {$name} and {$name[k1][k2]...} brace form (quoted keys allowed).
         if (c == '{' and i + 1 < raw.len and raw[i + 1] == '$') {
             var j = i + 2;
             if (readIdent(raw, &j)) |name| {
-                var key_str: ?[]const u8 = null;
-                var key_int: i64 = 0;
-                var has_key = false;
-                if (j < raw.len and raw[j] == '[') {
-                    var k = j + 1;
-                    if (k < raw.len and (raw[k] == '\'' or raw[k] == '"')) {
-                        // {$o["k"]} — quoted keys allowed only in brace form.
-                        const q = raw[k];
-                        const ks = k + 1;
-                        var e = ks;
-                        while (e < raw.len and raw[e] != q) e += 1;
-                        if (e < raw.len and e + 1 < raw.len and raw[e + 1] == ']') {
-                            key_str = raw[ks..e];
-                            has_key = true;
-                            k = e + 2;
-                        }
-                    } else if (readIdentUntil(raw, &k, ']')) |key| {
-                        key_str = key;
-                        has_key = true;
-                        if (k < raw.len and raw[k] == ']') k += 1 else {
-                            key_str = null;
-                            has_key = false;
-                            k = j; // rewind: not a valid form
-                        }
+                var keys: std.ArrayList(ast.IndexKey) = .empty;
+                while (j < raw.len and raw[j] == '[') {
+                    const start = j;
+                    if (readIndexKey(raw, &j)) |key| {
+                        try keys.append(arena, key);
                     } else {
-                        var iv: i64 = 0;
-                        var any = false;
-                        while (k < raw.len and std.ascii.isDigit(raw[k])) : (k += 1) {
-                            iv = iv * 10 + (raw[k] - '0');
-                            any = true;
-                        }
-                        if (any and k < raw.len and raw[k] == ']') {
-                            key_int = iv;
-                            has_key = true;
-                            k += 1;
-                        } else {
-                            k = j;
-                        }
+                        j = start; // not a valid chain; rewind
+                        break;
                     }
-                    j = k;
                 }
                 if (j < raw.len and raw[j] == '}') {
                     j += 1;
                     try flushLit(arena, &parts, &buf);
-                    try appendVarPart(arena, &parts, name, key_str, key_int, has_key);
+                    try appendVarPart(arena, &parts, name, keys.items);
                     i = j;
                     continue;
                 }
             }
         }
 
-        // $name and $name[key]
+        // $name and $name[key] (single level, PHP's simple syntax)
         if (c == '$' and i + 1 < raw.len and isIdentStartB(raw[i + 1])) {
             var j = i + 1;
             const name = readIdent(raw, &j).?;
-            var key_str: ?[]const u8 = null;
-            var key_int: i64 = 0;
-            var has_key = false;
+            var keys: std.ArrayList(ast.IndexKey) = .empty;
             if (j < raw.len and raw[j] == '[') {
-                var k = j + 1;
-                if (readIdentUntil(raw, &k, ']')) |key| {
-                    key_str = key;
-                    has_key = true;
-                } else {
-                    var iv: i64 = 0;
-                    var any = false;
-                    while (k < raw.len and std.ascii.isDigit(raw[k])) : (k += 1) {
-                        iv = iv * 10 + (raw[k] - '0');
-                        any = true;
-                    }
-                    if (any and k < raw.len and raw[k] == ']') {
-                        key_int = iv;
-                        has_key = true;
-                    }
-                }
-                if (has_key) {
-                    while (k < raw.len and raw[k] != ']') k += 1;
-                    if (k < raw.len) k += 1;
-                    j = k;
+                if (readIndexKey(raw, &j)) |key| {
+                    try keys.append(arena, key);
                 }
             }
             try flushLit(arena, &parts, &buf);
-            try appendVarPart(arena, &parts, name, key_str, key_int, has_key);
+            try appendVarPart(arena, &parts, name, keys.items);
             i = j;
             continue;
         }
@@ -919,19 +869,59 @@ fn splitInterpolated(arena: std.mem.Allocator, raw: []const u8) ![]ast.StrPart {
     return parts.toOwnedSlice(arena);
 }
 
+/// Read `[key]` starting at raw[j.*] == '['; advances past the closing ']'.
+/// Keys may be bare identifiers, integers, or (used from the brace form)
+/// quoted strings. Returns null when the form is invalid.
+fn readIndexKey(raw: []const u8, j: *usize) ?ast.IndexKey {
+    if (j.* >= raw.len or raw[j.*] != '[') return null;
+    var k = j.* + 1;
+
+    // Quoted string key.
+    if (k < raw.len and (raw[k] == '\'' or raw[k] == '"')) {
+        const q = raw[k];
+        const ks = k + 1;
+        var e = ks;
+        while (e < raw.len and raw[e] != q) e += 1;
+        if (e < raw.len and e + 1 < raw.len and raw[e + 1] == ']') {
+            j.* = e + 2;
+            return .{ .str = raw[ks..e] };
+        }
+        return null;
+    }
+
+    // Bare identifier.
+    if (readIdentUntil(raw, &k, ']')) |key| {
+        if (k < raw.len and raw[k] == ']') {
+            j.* = k + 1;
+            return .{ .str = key };
+        }
+        return null;
+    }
+
+    // Integer.
+    var iv: i64 = 0;
+    var any = false;
+    while (k < raw.len and std.ascii.isDigit(raw[k])) : (k += 1) {
+        iv = iv * 10 + (raw[k] - '0');
+        any = true;
+    }
+    if (any and k < raw.len and raw[k] == ']') {
+        j.* = k + 1;
+        return .{ .int = iv };
+    }
+    return null;
+}
+
 fn appendVarPart(
     arena: std.mem.Allocator,
     parts: *std.ArrayList(ast.StrPart),
     name: []const u8,
-    key_str: ?[]const u8,
-    key_int: i64,
-    has_key: bool,
+    keys: []const ast.IndexKey,
 ) !void {
-    if (has_key) {
+    if (keys.len > 0) {
         try parts.append(arena, .{ .var_index = .{
             .name = name,
-            .key_str = key_str,
-            .key_int = key_int,
+            .keys = try arena.dupe(ast.IndexKey, keys),
         } });
     } else {
         try parts.append(arena, .{ .var_ref = name });
