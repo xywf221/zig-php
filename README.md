@@ -86,14 +86,15 @@ ReleaseFast 下与 PHP 8.5 (OPcache) 的对比（Windows, min of 5）：
 
 | workload | zphp | php | 比率 |
 |---|---|---|---|
-| fib(27) 递归 | 101ms | 95ms | **1.1x** |
-| 3000 万次循环累加 | 2168ms | 492ms | 4.4x* |
-| 50 万次数组追加 + foreach | 94ms | 98ms | **1.0x** |
-| 10 万次字符串拼接 | 978ms | 81ms | 12.1x |
+| fib(27) 递归 | 102ms | 97ms | **1.1x** |
+| 3000 万次循环累加 | 1278ms | 488ms | 2.6x* |
+| 50 万次数组追加 + foreach | 83ms | 99ms | **0.8x** |
+| 10 万次字符串拼接 | 1006ms | 84ms | 12.0x |
 
-\\* 循环剩余差距为逐指令派发开销（栈式机器 vs PHP 的专用 handler），
-可通过指令融合（fused get/add/set）继续缩小。顶层变量已提升为主帧
-局部 slot，数组操作已与 PHP 持平。详见 [BENCHMARKS.md](BENCHMARKS.md)。
+\* 已实现指令融合：`local CMP const/local`+跳转、`local += x`、
+`$i++` 各自编译为单条指令，循环体从 ~13 条/迭代降至 4 条。
+剩余差距为逐指令派发开销。数组操作已反超 PHP。
+详见 [BENCHMARKS.md](BENCHMARKS.md)。
 
 ## 架构
 
@@ -129,7 +130,7 @@ vm.zig             栈式字节码虚拟机：共享操作数栈 + 每帧局部 
 
 - [x] 字节码编译 + 栈式 VM
 - [x] 内置函数标准库（string/array/math/type/output）
-- [ ] 指令融合（缩小循环性能差距）
+- [x] 指令融合（cmp-jmp / 复合赋值 / 自增丢弃变体）
 - [ ] 引用语义 `&`
 - [ ] OOP 子集
 - [ ] 警告系统与 PHP 对齐的 float 科学计数法格式

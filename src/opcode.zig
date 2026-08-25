@@ -137,7 +137,29 @@ pub const Op = enum(u8) {
     // -- isset on plain variables -----------------------------------------------------------------------------
     isset_local,
     isset_global, // arg = name const
+
+    // -- fused superinstructions (hot-loop optimization) ----------------------------------------------------------
+    /// Compound assign between local slots, result discarded (statement
+    /// context). arg = dst_slot | (src_slot << 16).
+    add_set_local_local,
+    sub_set_local_local,
+    /// arg = dst_slot | (const_index << 16).
+    add_set_local_const,
+    sub_set_local_const,
+    /// Post increment/decrement of a local whose result is discarded.
+    post_inc_local_discard,
+    post_dec_local_discard,
+    /// Compare two local slots and jump (to inline word target) when the
+    /// condition is FALSE. arg = a_slot | (b_slot << 13) | (cmp << 26);
+    /// followed by one inline_arg word (target).
+    cmp_jmp_local_local,
+    /// Compare local vs constant. arg = slot | (cmp << 24); followed by
+    /// two inline_arg words: const index, then target.
+    cmp_jmp_local_const,
 };
+
+/// Comparison selectors for fused compare-and-branch ops.
+pub const CmpSel = enum(u8) { lt, gt, lte, gte, eq, neq };
 
 /// One decoded instruction.
 pub const Instr = struct {

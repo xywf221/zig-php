@@ -166,8 +166,9 @@ pub const Compiler = struct {
         return self.chunk.code.items.len - 1;
     }
 
-    fn emitInline(self: *Compiler, word: u32, line: u32) Error!void {
+    fn emitInline(self: *Compiler, word: u32, line: u32) Error!usize {
         _ = self.chunk.emitArg(self.arena, .inline_arg, word, line) catch return error.OutOfMemory;
+        return self.chunk.code.items.len - 1;
     }
 
     fn patchJmp(self: *Compiler, addr: usize) Error!void {
@@ -211,6 +212,10 @@ pub const Compiler = struct {
         switch (s.kind) {
             .nop => {},
             .expr => |e| {
+                // Statement-level fusion: `$x += y;` / `$x -= const;` /
+                // `$i++;` discard their results, so a single fused
+                // instruction replaces the whole read-modify-write chain.
+                if (try self.tryEmitFusedAssignStmt(e)) return;
                 try self.compileExpr(e);
                 _ = try self.emit(.pop, line);
             },
@@ -237,11 +242,24 @@ pub const Compiler = struct {
                 const lc = try self.newLoop();
                 lc.continue_addr = self.here();
 
-                try self.compileExpr(w.cond);
-                const exit_jump = try self.emit(.jmp_if_false, line);
+                // Hot-path fusion: `local CMP (local|const)` becomes a
+                // single compare-and-branch instruction.
+                var fused_exit: ?usize = null;
+                if (try self.tryEmitCondJump(w.cond, line)) |pos| {
+                    fused_exit = pos;
+                } else {
+                    try self.compileExpr(w.cond);
+                }
+
+                var exit_jump: ?usize = null;
+                if (fused_exit == null) exit_jump = try self.emit(.jmp_if_false, line);
                 try self.compileBody(w.body);
                 _ = try self.emitArg(.jmp, @intCast(lc.continue_addr), line);
-                try self.patchJmp(exit_jump);
+                if (fused_exit) |pos| {
+                    self.chunk.code.items[pos].arg = @intCast(self.here());
+                } else if (exit_jump) |ej| {
+                    try self.patchJmp(ej);
+                }
                 try self.endLoop(lc);
             },
 
@@ -266,19 +284,28 @@ pub const Compiler = struct {
                 lc.continue_addr = 0; // patched to step exprs below
 
                 var exit_jump: ?usize = null;
+                var fused_exit: ?usize = null;
                 if (f.cond) |cond| {
-                    try self.compileExpr(cond);
-                    exit_jump = try self.emit(.jmp_if_false, line);
+                    if (try self.tryEmitCondJump(cond, line)) |pos| {
+                        fused_exit = pos;
+                    } else {
+                        try self.compileExpr(cond);
+                        exit_jump = try self.emit(.jmp_if_false, line);
+                    }
                 }
                 try self.compileBody(f.body);
                 const step_addr = self.here();
                 lc.continue_addr = step_addr; // continue -> step expressions
                 for (f.step) |e| {
+                    if (try self.tryEmitFusedAssignStmt(e)) continue;
                     try self.compileExpr(e);
                     _ = try self.emit(.pop, e.line);
                 }
                 _ = try self.emitArg(.jmp, @intCast(cond_addr), line);
                 if (exit_jump) |ej| try self.patchJmp(ej);
+                if (fused_exit) |pos| {
+                    self.chunk.code.items[pos].arg = @intCast(self.here());
+                }
                 try self.endLoop(lc);
             },
 
@@ -294,7 +321,7 @@ pub const Compiler = struct {
                 _ = try self.emitArg(.foreach_next, packed_arg, line);
                 // Loop-exit target follows as immediate data.
                 const inline_pos = self.here();
-                try self.emitInline(0, line); // patched after body
+                _ = try self.emitInline(0, line); // patched after body
 
                 // Bind value then key — foreach_next pushed [key?] value,
                 // so the value sits on top and must be stored first.
@@ -325,6 +352,140 @@ pub const Compiler = struct {
 
             .brk => |level| try self.jumpOut(level, false, line),
             .cont => |level| try self.jumpOut(level, true, line),
+        }
+    }
+
+    // -- fused superinstructions -------------------------------------------------
+
+    fn cmpSelOf(op: ast.BinOp) ?opcode.CmpSel {
+        return switch (op) {
+            .lt => .lt,
+            .gt => .gt,
+            .lte => .lte,
+            .gte => .gte,
+            .eq => .eq,
+            .neq => .neq,
+            else => null,
+        };
+    }
+
+    const FusedOperand = union(enum) {
+        local: usize,
+        constant: u32, // const pool index
+    };
+
+    /// Classify an operand for fusion: local slot or compile-time constant.
+    fn fusedOperand(self: *Compiler, e: *ast.Expr) Error!?FusedOperand {
+        switch (e.kind) {
+            .var_ref => |name| {
+                const slot = try self.ctx.resolveLocal(self.arena, name);
+                if (slot > 0x1FFF) return null;
+                return .{ .local = slot };
+            },
+            else => {
+                const cv = constEval(e) orelse return null;
+                const idx = self.chunk.addConst(self.arena, cv) catch return error.OutOfMemory;
+                return .{ .constant = idx };
+            },
+        }
+    }
+
+    /// Statement `$x <op>= y;` / `$x++;` with discarded result -> one fused
+    /// instruction. Returns false when the pattern does not apply.
+    fn tryEmitFusedAssignStmt(self: *Compiler, e: *ast.Expr) Error!bool {
+        const line = e.line;
+        if (e.kind == .inc_dec) {
+            const d = e.kind.inc_dec;
+            if (!d.postfix) return false;
+            if (d.target.kind != .var_ref) return false;
+            const slot = try self.ctx.resolveLocal(self.arena, d.target.kind.var_ref);
+            const op: Op = if (d.up) .post_inc_local_discard else .post_dec_local_discard;
+            _ = try self.emitArg(op, @intCast(slot), line);
+            return true;
+        }
+        if (e.kind != .assign) return false;
+        const a = e.kind.assign;
+        if (a.target.kind != .var_ref) return false;
+        const arith_kind: ArithFusion = switch (a.op) {
+            .add => .add,
+            .sub => .sub,
+            else => return false,
+        };
+        const dst = try self.ctx.resolveLocal(self.arena, a.target.kind.var_ref);
+        if (dst > 0xFFFF) return false;
+        const src = try self.fusedOperand(a.value) orelse return false;
+        switch (src) {
+            .local => |src_slot| {
+                if (src_slot > 0xFFFF) return false;
+                const op: Op = switch (arith_kind) {
+                    .add => .add_set_local_local,
+                    .sub => .sub_set_local_local,
+                };
+                _ = try self.emitArg(op, @intCast(dst | (src_slot << 16)), line);
+            },
+            .constant => |ci| {
+                if (ci > 0xFFFF) return false;
+                const op: Op = switch (arith_kind) {
+                    .add => .add_set_local_const,
+                    .sub => .sub_set_local_const,
+                };
+                _ = try self.emitArg(op, @intCast(dst | (ci << 16)), line);
+            },
+        }
+        return true;
+    }
+
+    const ArithFusion = enum { add, sub };
+
+    /// Fuse `local CMP (local|const)` loop conditions into a single
+    /// compare-and-branch instruction. Returns the inline-word position to
+    /// patch with the loop-exit target, or null when the pattern does not
+    /// apply (caller falls back to the generic path).
+    fn tryEmitCondJump(self: *Compiler, cond: *ast.Expr, line: u32) Error!?usize {
+        if (cond.kind != .binary) return null;
+        const b = cond.kind.binary;
+        var sel = cmpSelOf(b.op) orelse return null;
+
+        var lhs = try self.fusedOperand(b.lhs);
+        var rhs = try self.fusedOperand(b.rhs);
+        // Mirror when the constant/local arrangement needs it:
+        // (const CMP local) == (local flip(CMP) const)
+        if (lhs != null and lhs.? == .local and rhs != null and rhs.? == .local) {
+            // both locals: direct ll form below
+        } else if (rhs != null and rhs.? == .local and (lhs == null or lhs.? == .constant)) {
+            sel = switch (sel) {
+                .lt => .gt,
+                .gt => .lt,
+                .lte => .gte,
+                .gte => .lte,
+                .eq => .eq,
+                .neq => .neq,
+            };
+            const tmp = lhs;
+            lhs = rhs;
+            rhs = tmp;
+        }
+
+        switch (lhs orelse return null) {
+            .local => |slot| switch (rhs orelse return null) {
+                .local => |slot2| {
+                    const arg: u32 = @as(u32, @intFromEnum(sel)) << 26 |
+                        (@as(u32, @intCast(slot2)) << 13) |
+                        @as(u32, @intCast(slot));
+                    _ = try self.emitArg(.cmp_jmp_local_local, arg, line);
+                    const inline_pos = try self.emitInline(0, line); // target patched by caller
+                    return inline_pos;
+                },
+                .constant => |ci| {
+                    if (ci > 0xFFFFFF) return null;
+                    const arg: u32 = (@as(u32, @intFromEnum(sel)) << 24) | @as(u32, @intCast(slot));
+                    _ = try self.emitArg(.cmp_jmp_local_const, arg, line);
+                    _ = try self.emitInline(ci, line);
+                    const target_pos = try self.emitInline(0, line);
+                    return target_pos;
+                },
+            },
+            .constant => return null, // const CMP const — no point fusing
         }
     }
 

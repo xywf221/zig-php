@@ -454,6 +454,56 @@ pub const Vm = struct {
                     const v = self.globals.get(consts[instr.arg].str_) orelse .null_;
                     try self.push(.{ .bool_ = v != .null_ });
                 },
+
+                // -- fused superinstructions ---------------------------------------------------
+                .add_set_local_local => {
+                    const dst = instr.arg & 0xFFFF;
+                    const src = instr.arg >> 16;
+                    f.locals[dst] = try self.arithRaw(.add, f.locals[dst], f.locals[src], line);
+                },
+                .sub_set_local_local => {
+                    const dst = instr.arg & 0xFFFF;
+                    const src = instr.arg >> 16;
+                    f.locals[dst] = try self.arithRaw(.sub, f.locals[dst], f.locals[src], line);
+                },
+                .add_set_local_const => {
+                    const dst = instr.arg & 0xFFFF;
+                    f.locals[dst] = try self.arithRaw(.add, f.locals[dst], consts[instr.arg >> 16], line);
+                },
+                .sub_set_local_const => {
+                    const dst = instr.arg & 0xFFFF;
+                    f.locals[dst] = try self.arithRaw(.sub, f.locals[dst], consts[instr.arg >> 16], line);
+                },
+                .post_inc_local_discard => {
+                    _ = try self.incLocalSlot(f, instr.arg, true, false);
+                    _ = self.pop();
+                },
+                .post_dec_local_discard => {
+                    _ = try self.incLocalSlot(f, instr.arg, false, false);
+                    _ = self.pop();
+                },
+                .cmp_jmp_local_local => {
+                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((instr.arg >> 26) & 0x7)));
+                    const a = instr.arg & 0x1FFF;
+                    const b = (instr.arg >> 13) & 0x1FFF;
+                    const target = code[f.ip].arg; // inline word
+                    if (!(try self.cmpBool(cmpSelToKind(sel), f.locals[a], f.locals[b]))) {
+                        f.ip = target;
+                        continue;
+                    }
+                    f.ip += 1; // skip inline word on fallthrough
+                },
+                .cmp_jmp_local_const => {
+                    const sel: opcode.CmpSel = @enumFromInt(@as(u8, @intCast((instr.arg >> 24) & 0x7)));
+                    const slot = instr.arg & 0xFFFFFF;
+                    const const_idx = code[f.ip].arg; // first inline word
+                    const target = code[f.ip + 1].arg; // second inline word
+                    if (!(try self.cmpBool(cmpSelToKind(sel), f.locals[slot], consts[const_idx]))) {
+                        f.ip = target;
+                        continue;
+                    }
+                    f.ip += 2; // skip both inline words
+                },
             }
         }
     }
@@ -466,7 +516,12 @@ pub const Vm = struct {
     fn binOp(self: *Vm, kind: ArithKind, line: u32) Error!void {
         const r = self.pop();
         const l = self.pop();
+        try self.push(try self.arithRaw(kind, l, r, line));
+    }
 
+    /// Arithmetic returning a value (shared by stack ops and fused
+    /// compound-assign instructions).
+    fn arithRaw(self: *Vm, kind: ArithKind, l: Value, r: Value, line: u32) Error!Value {
         if (l == .array_ or r == .array_) {
             return self.fatalF(line, "unsupported operand types: {s} and {s}", .{ l.typeName(), r.typeName() });
         }
@@ -480,36 +535,36 @@ pub const Vm = struct {
             switch (kind) {
                 .add => {
                     const res = @addWithOverflow(a, b);
-                    if (res[1] == 0) return self.push(.{ .int_ = res[0] });
-                    return self.push(.{ .float_ = @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)) });
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)) };
                 },
                 .sub => {
                     const res = @subWithOverflow(a, b);
-                    if (res[1] == 0) return self.push(.{ .int_ = res[0] });
-                    return self.push(.{ .float_ = @as(f64, @floatFromInt(a)) - @as(f64, @floatFromInt(b)) });
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(a)) - @as(f64, @floatFromInt(b)) };
                 },
                 .mul => {
                     const res = @mulWithOverflow(a, b);
-                    if (res[1] == 0) return self.push(.{ .int_ = res[0] });
-                    return self.push(.{ .float_ = @as(f64, @floatFromInt(a)) * @as(f64, @floatFromInt(b)) });
+                    if (res[1] == 0) return .{ .int_ = res[0] };
+                    return .{ .float_ = @as(f64, @floatFromInt(a)) * @as(f64, @floatFromInt(b)) };
                 },
                 .div => {
                     if (b == 0) return self.fatalF(line, "Division by zero", .{});
-                    if (@rem(a, b) == 0) return self.push(.{ .int_ = @divTrunc(a, b) });
-                    return self.push(.{ .float_ = @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b)) });
+                    if (@rem(a, b) == 0) return .{ .int_ = @divTrunc(a, b) };
+                    return .{ .float_ = @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b)) };
                 },
                 .mod => {
                     if (b == 0) return self.fatalF(line, "Modulo by zero", .{});
-                    return self.push(.{ .int_ = @rem(a, b) });
+                    return .{ .int_ = @rem(a, b) };
                 },
                 .pow => {
                     if (b >= 0 and b <= 62) {
                         var result: i64 = 1;
                         var i: i64 = 0;
                         while (i < b) : (i += 1) result *|= a;
-                        return self.push(.{ .int_ = result });
+                        return .{ .int_ = result };
                     }
-                    return self.push(.{ .float_ = std.math.pow(f64, @floatFromInt(a), @floatFromInt(b)) });
+                    return .{ .float_ = std.math.pow(f64, @floatFromInt(a), @floatFromInt(b)) };
                 },
             }
         }
@@ -517,20 +572,20 @@ pub const Vm = struct {
         // Float path.
         const a = ln.toFloat();
         const b = rn.toFloat();
-        switch (kind) {
-            .add => try self.push(.{ .float_ = a + b }),
-            .sub => try self.push(.{ .float_ = a - b }),
-            .mul => try self.push(.{ .float_ = a * b }),
-            .div => {
+        return switch (kind) {
+            .add => .{ .float_ = a + b },
+            .sub => .{ .float_ = a - b },
+            .mul => .{ .float_ = a * b },
+            .div => blk: {
                 if (b == 0.0) return self.fatalF(line, "Division by zero", .{});
-                try self.push(.{ .float_ = a / b });
+                break :blk Value{ .float_ = a / b };
             },
-            .mod => {
+            .mod => blk: {
                 if (b == 0.0) return self.fatalF(line, "Modulo by zero", .{});
-                try self.push(.{ .int_ = @rem(@as(i64, @intFromFloat(@trunc(a))), @as(i64, @intFromFloat(@trunc(b)))) });
+                break :blk Value{ .int_ = @rem(@as(i64, @intFromFloat(@trunc(a))), @as(i64, @intFromFloat(@trunc(b)))) };
             },
-            .pow => try self.push(.{ .float_ = std.math.pow(f64, a, b) }),
-        }
+            .pow => .{ .float_ = std.math.pow(f64, a, b) },
+        };
     }
 
     fn intBin(self: *Vm, kind: BitKind, line: u32) Error!void {
@@ -549,11 +604,21 @@ pub const Vm = struct {
         try self.push(.{ .int_ = result });
     }
 
-    fn cmpOp(self: *Vm, kind: enum { eq, neq, lt, gt, lte, gte }, line: u32) Error!void {
-        _ = line;
-        const r = self.pop();
-        const l = self.pop();
-        const result: bool = switch (kind) {
+    const CmpKind = enum { eq, neq, lt, gt, lte, gte };
+
+    fn cmpSelToKind(sel: opcode.CmpSel) CmpKind {
+        return switch (sel) {
+            .lt => .lt,
+            .gt => .gt,
+            .lte => .lte,
+            .gte => .gte,
+            .eq => .eq,
+            .neq => .neq,
+        };
+    }
+
+    fn cmpBool(self: *Vm, kind: CmpKind, l: Value, r: Value) Error!bool {
+        return switch (kind) {
             .eq => try valmod.looseEq(l, r, self.arena),
             .neq => !(try valmod.looseEq(l, r, self.arena)),
             .lt => (try valmod.looseCmp(l, r, self.arena)) == .lt,
@@ -561,7 +626,13 @@ pub const Vm = struct {
             .lte => (try valmod.looseCmp(l, r, self.arena)) != .gt,
             .gte => (try valmod.looseCmp(l, r, self.arena)) != .lt,
         };
-        try self.push(.{ .bool_ = result });
+    }
+
+    fn cmpOp(self: *Vm, kind: CmpKind, line: u32) Error!void {
+        _ = line;
+        const r = self.pop();
+        const l = self.pop();
+        try self.push(.{ .bool_ = try self.cmpBool(kind, l, r) });
     }
 
     fn indexRead(self: *Vm, container: Value, key_v: Value, line: u32) Error!Value {
