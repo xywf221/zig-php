@@ -11,4 +11,5 @@ comptime {
     _ = @import("test_lexer.zig");
     _ = @import("test_parser.zig");
     _ = @import("tests_impl.zig");
+    _ = @import("test_register.zig");
 }

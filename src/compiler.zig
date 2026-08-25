@@ -32,6 +32,9 @@ pub const Diag = struct {
 pub const Program = struct {
     main_func: *Func,
     funcs: std.StringHashMapUnmanaged(*Func) = .empty,
+    /// Functions declared unconditionally at the top level — hoisted at VM
+    /// startup. Conditional declarations register via declare_func instead.
+    hoisted: std.StringHashMapUnmanaged(void) = .empty,
 };
 
 pub const Compiler = struct {
@@ -221,26 +224,36 @@ pub const Compiler = struct {
     }
 
     fn collectFuncs(arena: std.mem.Allocator, stmts: []const *ast.Stmt, program: *Program, diag: *Diag) Error!void {
-        for (stmts) |s| try collectFuncsStmt(arena, s, program, diag);
+        for (stmts) |s| try collectFuncsStmt(arena, s, program, diag, true);
     }
 
-    fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag) Error!void {
+    /// Walk a nested body: declarations inside never hoist.
+    fn collectFuncsNested(arena: std.mem.Allocator, stmts: []const *ast.Stmt, program: *Program, diag: *Diag) Error!void {
+        for (stmts) |s| try collectFuncsStmt(arena, s, program, diag, false);
+    }
+
+    /// Walk every statement tree — functions may be declared conditionally
+    /// or nested inside other functions. Only direct top-level declarations
+    /// are marked hoisted.
+    fn collectFuncsStmt(arena: std.mem.Allocator, st: *ast.Stmt, program: *Program, diag: *Diag, hoist: bool) Error!void {
         switch (st.kind) {
             .func_decl => |fd| {
-                if (program.funcs.contains(fd.name)) return; // first wins
-                const f = try compileFuncUnit(arena, fd, diag);
-                try program.funcs.put(arena, fd.name, f);
-                try collectFuncs(arena, fd.body, program, diag);
+                if (!program.funcs.contains(fd.name)) { // first wins
+                    const f = try compileFuncUnit(arena, fd, diag);
+                    try program.funcs.put(arena, fd.name, f);
+                }
+                if (hoist) try program.hoisted.put(arena, fd.name, {});
+                try collectFuncsNested(arena, fd.body, program, diag);
             },
             .block => |stmts| try collectFuncs(arena, stmts, program, diag),
             .if_stmt => |info| {
-                for (info.branches) |b| try collectFuncsStmt(arena, b.body, program, diag);
-                if (info.else_body) |eb| try collectFuncsStmt(arena, eb, program, diag);
+                for (info.branches) |b| try collectFuncsStmt(arena, b.body, program, diag, false);
+                if (info.else_body) |eb| try collectFuncsStmt(arena, eb, program, diag, false);
             },
-            .while_stmt => |w| try collectFuncsStmt(arena, w.body, program, diag),
-            .do_while => |dw| try collectFuncsStmt(arena, dw.body, program, diag),
-            .for_stmt => |f| try collectFuncsStmt(arena, f.body, program, diag),
-            .foreach => |fe| try collectFuncsStmt(arena, fe.body, program, diag),
+            .while_stmt => |w| try collectFuncsStmt(arena, w.body, program, diag, false),
+            .do_while => |dw| try collectFuncsStmt(arena, dw.body, program, diag, false),
+            .for_stmt => |fr| try collectFuncsStmt(arena, fr.body, program, diag, false),
+            .foreach => |fe| try collectFuncsStmt(arena, fe.body, program, diag, false),
             else => {},
         }
     }

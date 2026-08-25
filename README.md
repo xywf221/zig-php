@@ -72,8 +72,9 @@ zphp -v                    # 版本
 |---|---|---|
 | 词法单元测试 | `src/test_lexer.zig` | 全操作符、数字/字符串字面量、注释、行号、错误路径 |
 | 语法单元测试 | `src/test_parser.zig` | AST 结构断言：优先级、结合性、节点形状 |
-| 解释器集成测试 | `src/tests_impl.zig` | 端到端执行；**每个用例双引擎跑一遍并断言输出一致** |
-| 差分对照 | `scripts/differential.sh` | 与真实 PHP 8.x 逐条对比输出（黄金标准） |
+| 解释器集成测试 | `src/tests_impl.zig` | 端到端执行；**每个用例双引擎跑一遍并断言输出一致**；含历史 bug 回归清单 |
+| 寄存器 ISA 测试 | `src/test_register.zig` | 字节码结构断言：指令融合、调用约定、寄存器压力 |
+| 差分对照 | `scripts/differential.sh` | 与真实 PHP 8.x 逐条对比输出（黄金标准），已知偏差单独核算 |
 
 ```console
 zig build test                  # 单元 + 集成（双引擎）

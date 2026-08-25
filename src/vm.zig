@@ -53,11 +53,14 @@ pub const Vm = struct {
 
     pub fn init(arena: std.mem.Allocator, out: *std.Io.Writer, program: *compiler_mod.Program) Vm {
         var vm = Vm{ .arena = arena, .out = out, .program = program };
-        // Preload compiled declarations (PHP hoists unconditional top-level
-        // functions; conditional ones register via declare_func on execution).
-        var it = program.funcs.iterator();
-        while (it.next()) |entry| {
-            vm.funcs.put(arena, entry.key_ptr.*, entry.value_ptr.*) catch {};
+        // Preload only unconditional top-level declarations (PHP hoisting);
+        // conditional ones register via declare_func when execution reaches
+        // them.
+        var it = program.hoisted.keyIterator();
+        while (it.next()) |key| {
+            if (program.funcs.get(key.*)) |f| {
+                vm.funcs.put(arena, key.*, f) catch {};
+            }
         }
         return vm;
     }

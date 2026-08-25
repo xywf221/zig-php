@@ -149,6 +149,62 @@ fn expectFatal(code: []const u8, expected_msg: []const u8) !void {
 
 
 // ===========================================================================
+// Regression battery: one test per historically-broken behavior.
+// ===========================================================================
+
+test "regression: octal and hex literals" {
+    try expectOut("echo 010, '|', 0x10;", "8|16"); // was decimal 10
+}
+
+test "regression: break exits the loop exactly" {
+    try expectOut("$i=0; while($i<10){ $i++; if($i>3) break; } echo $i;", "4"); // was 10
+}
+
+test "regression: ??= assigns only when null" {
+    try expectOut("$y = null; $y ??= 's'; echo $y;", "s"); // was empty
+    try expectOut("$o = ['k' => 9]; echo \"{$o[\"k\"]}\";", "9"); // brace+quoted key
+}
+
+test "regression: xor operator compiles and evaluates" {
+    try expectOut("echo true xor false ? 't' : 'f';", "t"); // crashed the compiler
+}
+
+test "regression: mixed array literal key order" {
+    // Keyed pairs were emitted first, breaking auto-key sequencing.
+    try expectOut("$a = [9, 'k' => 2]; echo $a[0], '|', $a['k'];", "9|2");
+}
+
+test "regression: isset treats stored null as unset" {
+    try expectOut("$a = ['k' => null]; echo isset($a['k']) ? 'y' : 'n';", "n"); // was y
+}
+
+test "regression: numeric strings compare numerically" {
+    try expectOutVm("var_dump('10' < '9');", "bool(false)\n"); // was true (byte compare)
+}
+
+test "regression: missing required argument is fatal" {
+    try expectFatal("function f($a) {} f();", "Too few arguments to function f()"); // silently returned garbage
+}
+
+test "regression: nested function declarations register on execution" {
+    try expectFatal("function outer() { function inner() {} } inner();",
+        "Call to undefined function inner()"); // declared but never registered until outer runs
+    try expectOut("function outer2() { function inner2() {} } outer2(); echo inner2() === null ? 'ok' : 'x';", "ok");
+}
+
+test "regression: multi-level interpolation chains" {
+    try expectOut("$m = [[7]]; echo \"{$m[0][0]}\";", "7"); // printed 'Array'
+}
+
+test "regression: brace interpolation with quoted keys stays in string" {
+    try expectOut("$o = ['k' => 1]; echo \"v={$o[\"k\"]}\";", "v=1"); // lexer cut the string early
+}
+
+test "regression: single-quoted escapes stay literal" {
+    try expectOut("echo 'a\\n\\'b';", "a\\n'b"); // went through double-quote unescaping
+}
+
+// ===========================================================================
 // Arithmetic
 // ===========================================================================
 
