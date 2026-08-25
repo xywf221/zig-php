@@ -1,16 +1,25 @@
 //! zphp — a minimal PHP interpreter written in Zig, in the spirit of
 //! QuickJS: small, dependency-free, single binary.
 //!
+//! Two execution engines:
+//!   * bytecode VM (default): AST -> bytecode -> stack machine
+//!   * `--tree`: reference tree-walking interpreter (kept for parity testing)
+//!
 //! Usage:
 //!   zphp script.php [args...]
 //!   zphp -r "echo 'hello';"
+//!   zphp --tree script.php     force the reference engine
 //!   zphp --version | --help
 
 const std = @import("std");
-const tokmod = @import("token.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const ast = @import("ast.zig");
 const interp_mod = @import("interp.zig");
+const compiler_mod = @import("compiler.zig");
+const vm_mod = @import("vm.zig");
+
+var bc_diag: compiler_mod.Diag = .{};
 
 pub fn main(init: std.process.Init) !u8 {
     var out_buf: [16 * 1024]u8 = undefined;
@@ -24,21 +33,25 @@ pub fn main(init: std.process.Init) !u8 {
 
     var script_path: ?[]const u8 = null;
     var inline_code: ?[]const u8 = null;
+    var use_tree_engine = false;
 
     while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
+        if (std.mem.eql(u8, arg, "--tree")) {
+            use_tree_engine = true;
+        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
             inline_code = args_it.next() orelse {
                 try errPrint("zphp: {s} requires an argument\n", .{arg});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            try out.print("zphp 0.1.0 (minimal PHP interpreter)\n", .{});
+            try out.print("zphp 0.2.0 (bytecode VM)\n", .{});
             try out.flush();
             return 0;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try out.print(
                 \\Usage:
-                \\  zphp <script.php>      run a PHP script
+                \\  zphp <script.php>      run a PHP script (bytecode VM)
+                \\  zphp --tree <script>   run with the reference AST interpreter
                 \\  zphp -r "<code>"       run inline PHP code
                 \\  zphp -v                show version
                 \\
@@ -72,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
         };
     };
 
-    // ---- compile & run -------------------------------------------------------
+    // ---- frontend (shared by both engines) ------------------------------------
     var lx = lexer.Lexer.init(source);
     const tokens = lx.tokenize(arena) catch |e| {
         try errPrint("Parse error: {s} in {s}\n", .{ lexerErrorName(e), display_name });
@@ -81,7 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     var diag: parser.Diag = .{};
-    const program = parser.parse(arena, tokens, &diag) catch |e| switch (e) {
+    const program_ast = parser.parse(arena, tokens, &diag) catch |e| switch (e) {
         error.SyntaxError => {
             try errPrint("Parse error: {s} in {s} on line {d}\n", .{ diag.msg, display_name, diag.line });
             try out.flush();
@@ -93,14 +106,50 @@ pub fn main(init: std.process.Init) !u8 {
         },
     };
 
-    var interp = interp_mod.Interp.init(arena, out);
-    try interp.registerTopLevelFuncs(program);
+    // ---- execution -------------------------------------------------------------
+    if (use_tree_engine) {
+        var interp = interp_mod.Interp.init(arena, out);
+        try interp.registerTopLevelFuncs(program_ast);
+        interp.execProgram(program_ast) catch |e| switch (e) {
+            error.Fatal => {
+                try out.flush();
+                try errPrint("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ interp.msg, display_name, interp.line });
+                try out.print("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ interp.msg, display_name, interp.line });
+                try out.flush();
+                return 255;
+            },
+            error.OutOfMemory => {
+                try errPrint("zphp: out of memory\n", .{});
+                return 255;
+            },
+            else => {
+                try errPrint("zphp: internal error: {s}\n", .{@errorName(e)});
+                return 70;
+            },
+        };
+        try out.flush();
+        return 0;
+    }
 
-    interp.execProgram(program) catch |e| switch (e) {
+    // Bytecode pipeline: AST -> bytecode -> VM.
+    const bc_program = compiler_mod.Compiler.compile(arena, program_ast, &bc_diag) catch |e| switch (e) {
+        error.SyntaxError => {
+            try errPrint("Compile error: {s} in {s} on line {d}\n", .{ bc_diag.msg, display_name, bc_diag.line });
+            try out.flush();
+            return 255;
+        },
+        error.OutOfMemory => {
+            try errPrint("zphp: out of memory\n", .{});
+            return 255;
+        },
+    };
+
+    var vm = vm_mod.Vm.init(arena, out, bc_program);
+    vm.run() catch |e| switch (e) {
         error.Fatal => {
             try out.flush();
-            try errPrint("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ interp.msg, display_name, interp.line });
-            try out.print("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ interp.msg, display_name, interp.line });
+            try errPrint("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
+            try out.print("PHP Fatal error: Uncaught Error: {s} in {s}:{d}\n", .{ vm.msg, display_name, vm.line });
             try out.flush();
             return 255;
         },
@@ -130,4 +179,8 @@ fn lexerErrorName(e: lexer.Error) []const u8 {
 
 fn errPrint(comptime fmt: []const u8, args: anytype) !void {
     std.debug.print(fmt, args);
+}
+
+comptime {
+    _ = ast; // re-exported for tooling/tests
 }

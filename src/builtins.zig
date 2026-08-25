@@ -7,9 +7,9 @@
 
 const std = @import("std");
 const valmod = @import("value.zig");
-const interp_mod = @import("interp.zig");
+const interp_mod = @import("vm.zig");
 
-const Interp = interp_mod.Interp;
+const Interp = interp_mod.Vm;
 const Value = valmod.Value;
 const Error = interp_mod.Error;
 

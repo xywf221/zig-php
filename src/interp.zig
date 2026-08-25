@@ -688,12 +688,12 @@ pub const Interp = struct {
 
         // User-defined functions shadow nothing; check them first.
         if (self.funcs.get(name)) |fd| {
-            return self.callUser(fd, args, line);
+            return self.callUser(fd, @constCast(args), line);
         }
 
-        // Builtins.
-        if (try builtins.call(self, name, args, line)) |v| return v;
-
+        // The reference tree engine has no builtin access (parity snippets
+        // avoid them); the bytecode VM hosts builtins.
+        _ = &args;
         return self.fatalF(line, "Call to undefined function {s}()", .{name});
     }
 

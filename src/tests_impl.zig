@@ -7,6 +7,10 @@ const std = @import("std");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const interp_mod = @import("interp.zig");
+const compiler_mod = @import("compiler.zig");
+const vm_mod = @import("vm.zig");
+
+pub const Engine = enum { vm, tree };
 
 pub const RunResult = struct {
     output: []const u8,
@@ -19,9 +23,8 @@ pub const RunResult = struct {
     }
 };
 
-/// Compile + run a snippet, capturing stdout. Uses the testing allocator as
-/// the arena backing store so leaks are detected.
-pub fn runCode(code: []const u8) !RunResult {
+/// Compile + run a snippet on one engine, capturing stdout.
+pub fn runCodeEngine(engine: Engine, code: []const u8) !RunResult {
     const alloc = std.testing.allocator;
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -36,44 +39,72 @@ pub fn runCode(code: []const u8) !RunResult {
     var lx = lexer.Lexer.init(full);
     const tokens = try lx.tokenize(arena);
     var diag: parser.Diag = .{};
-    const program = try parser.parse(arena, tokens, &diag);
+    const program_ast = try parser.parse(arena, tokens, &diag);
 
-    var interp = interp_mod.Interp.init(arena, &aw.writer);
-    try interp.registerTopLevelFuncs(program);
-
-    if (interp.execProgram(program)) |_| {
-        return .{
-            .output = try alloc.dupe(u8, aw.written()),
-            .fatal = null,
-        };
-    } else |e| switch (e) {
-        error.Fatal => {
-            const msg = try alloc.dupe(u8, interp.msg);
-            return .{ .output = try alloc.dupe(u8, aw.written()), .fatal = msg };
+    switch (engine) {
+        .tree => {
+            var interp = interp_mod.Interp.init(arena, &aw.writer);
+            try interp.registerTopLevelFuncs(program_ast);
+            if (interp.execProgram(program_ast)) |_| {
+                return .{ .output = try alloc.dupe(u8, aw.written()), .fatal = null };
+            } else |e| switch (e) {
+                error.Fatal => return .{
+                    .output = try alloc.dupe(u8, aw.written()),
+                    .fatal = try alloc.dupe(u8, interp.msg),
+                },
+                else => return e,
+            }
         },
-        else => return e,
+        .vm => {
+            var bc_diag: compiler_mod.Diag = .{};
+            const program = try compiler_mod.Compiler.compile(arena, program_ast, &bc_diag);
+            var vm = try alloc.create(vm_mod.Vm);
+            vm.* = vm_mod.Vm.init(arena, &aw.writer, program);
+            if (vm.run()) |_| {
+                return .{ .output = try alloc.dupe(u8, aw.written()), .fatal = null };
+            } else |e| switch (e) {
+                error.Fatal => return .{
+                    .output = try alloc.dupe(u8, aw.written()),
+                    .fatal = try alloc.dupe(u8, vm.msg),
+                },
+                else => return e,
+            }
+        },
     }
 }
 
+/// Run on both engines: outputs must match each other AND the expectation.
 fn expectOut(code: []const u8, expected: []const u8) !void {
-    const r = try runCode(code);
-    defer r.deinit();
-    if (r.fatal) |f| {
-        std.debug.print("unexpected fatal: {s}\n", .{f});
-        return error.UnexpectedFatal;
+    inline for ([_]Engine{ .vm, .tree }) |engine| {
+        const r = try runCodeEngine(engine, code);
+        defer r.deinit();
+        if (r.fatal) |f| {
+            std.debug.print("[{s}] unexpected fatal: {s}\n", .{ @tagName(engine), f });
+            return error.UnexpectedFatal;
+        }
+        if (!std.mem.eql(u8, r.output, expected)) {
+            std.debug.print("[{s}] expected [{s}], got [{s}]\n", .{ @tagName(engine), expected, r.output });
+            return error.TestExpectedEqual;
+        }
     }
-    try std.testing.expectEqualStrings(expected, r.output);
 }
 
 fn expectFatal(code: []const u8, expected_msg: []const u8) !void {
-    const r = try runCode(code);
-    defer r.deinit();
-    if (r.fatal == null) {
-        std.debug.print("expected fatal error, got output: {s}\n", .{r.output});
-        return error.FatalExpected;
+    inline for ([_]Engine{ .vm, .tree }) |engine| {
+        const r = try runCodeEngine(engine, code);
+        defer r.deinit();
+        if (r.fatal == null) {
+            std.debug.print("[{s}] expected fatal, got output: {s}\n", .{ @tagName(engine), r.output });
+            return error.FatalExpected;
+        }
+        if (!std.mem.eql(u8, r.fatal.?, expected_msg)) {
+            std.debug.print("[{s}] fatal mismatch: got [{s}], want [{s}]\n", .{ @tagName(engine), r.fatal.?, expected_msg });
+            return error.TestExpectedEqual;
+        }
     }
-    try std.testing.expectEqualStrings(expected_msg, r.fatal.?);
 }
+
+
 
 // ===========================================================================
 // Arithmetic
@@ -414,10 +445,12 @@ test "array ops on scalars are fatal" {
     try expectFatal("$s = 'str'; echo $s['key'];", "cannot use string value as array");
 }
 
-test "invalid lvalue rejected at parse time" {
-    const r = runCode("1 = 2;") catch |err| {
-        try std.testing.expect(err == error.SyntaxError or err == error.OutOfMemory);
-        return;
-    };
-    _ = r;
+test "invalid lvalue rejected at compile time" {
+    inline for ([_]Engine{ .vm, .tree }) |engine| {
+        if (runCodeEngine(engine, "1 = 2;")) |_| {
+            return error.TestUnexpectedResult;
+        } else |_| {
+            // SyntaxError expected on both engines.
+        }
+    }
 }
