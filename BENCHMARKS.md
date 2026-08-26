@@ -65,52 +65,16 @@ Key optimizations beyond the ISA switch itself:
 - Array performance beats the reference because ordered-dict operations map
   well onto an entry list with a next-index fast path.
 
-## JIT (baseline, tier-1) — EXPERIMENTAL, opt-in via `--jit`
+## JIT — removed
 
-`src/jit.zig` compiles eligible user functions to native x86-64 on first
-invocation (Windows x64 ABI). Tier-1 op set: int const/mov/add/sub/mul,
-inc, int compare-and-branch, jmp, returns. Every potentially-failing check
-is guarded (tag-byte compares + overflow `jo`); a failed guard deopts by
-returning the bytecode resume-ip and the interpreter finishes the call.
-Compilation is all-or-nothing per function: one unsupported op (division,
-strings, calls...) bails to interpretation.
+A baseline x86-64 JIT (tier-1 int ops, guarded, deopt-to-interpreter) was
+built and benchmarked at ~46 ms for sumTo(30M) (interp 884 ms, PHP 412 ms)
+but was REMOVED: under ReleaseFast it corrupted VM state nondeterministically
+on the deopt path. The emitted machine code and ABI usage verified correct
+byte-by-byte; the failure was layout-dependent and shifted with unrelated
+source edits, resisting root-causing. Full post-mortem:
+docs/JIT_DESIGN.md.
 
-**Status: NOT enabled by default.** Under ReleaseFast builds, deopt-path
-executions corrupt VM state nondeterministically (garbage operand types,
-segfaults far from the call site). The emitted machine code hand-decodes
-correct and the ABI contract is verified; Debug/ReleaseSafe never exercise
-the JIT because probeLayout legitimately fails there (tag-word padding),
-which masked the issue during development. The trigger interacts with
-apparently irrelevant source changes (layout-dependent UB); suspected but
-unconfirmed causes include Zig 0.16-dev codegen around indirect calls into
-raw executable memory. Isolation hardening (running against a scratch
-buffer) reduces but does not eliminate it.
-
-Measured when it does run (ReleaseFast, microtime inside PHP):
-
-| workload | zphp interp | zphp --jit | php 8.5 |
-|---|---:|---:|---:|
-| sumTo(30M) — pure int accumulation | 948 ms | **46 ms** | 403 ms |
-
-i.e. ~20x over our interpreter, ~9x over PHP CLI for the tier-1 sweet spot.
-
-Debug notes for future work:
-- Value layout is probed at runtime (payload/tag word order varies with
-  Zig's union layout); tag guards must be byte compares (`80 B9 disp8`)
-  because the interpreter only writes the low tag byte — pooled register
-  files leave stale high bytes.
-- ADD/SUB/CMP encode dest in rm field, src in reg field; IMUL r64,r/m64
-  is the reverse. Getting REX.B/R backwards silently corrupts results.
-- The normal-exit block must not fall through into the deopt-exit block;
-  that turned every completion into a spurious deopt (correct output,
-  double execution).
-- invokeUser (methods/ctors/statics) must dispatch after pushing a deopt-
-  resumed frame — its callers sit inside an outer dispatch() that keeps
-  executing the CALLER frame; an undispatched zombie frame corrupts the
-  frame stack (segfault). doCall already dispatched correctly.
-- probeLayout fails under Debug/ReleaseSafe (union padding leaves garbage
-  in the tag word's high bytes), so the JIT is silently skipped there;
-  don't trust Debug-mode JIT test results as JIT coverage.
 
 ## Planned improvements
 

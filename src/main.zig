@@ -14,7 +14,6 @@ const parser = @import("parser.zig");
 const ast = @import("ast.zig");
 const compiler_mod = @import("compiler.zig");
 const vm_mod = @import("vm.zig");
-const jitmod = @import("jit.zig");
 
 var bc_diag: compiler_mod.Diag = .{};
 
@@ -32,13 +31,7 @@ pub fn main(init: std.process.Init) !u8 {
     var inline_code: ?[]const u8 = null;
 
     while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--jit")) {
-            // Baseline JIT is opt-in: see docs/JIT_DESIGN.md ("known issues")
-            // for why it is not enabled by default yet.
-            jitmod.enabled = true;
-        } else if (std.mem.eql(u8, arg, "--no-jit")) {
-            jitmod.enabled = false;
-        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
+        if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
             inline_code = args_it.next() orelse {
                 try errPrint("zphp: {s} requires an argument\n", .{arg});
                 return 2;

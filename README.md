@@ -66,8 +66,6 @@ zig build run -- script.php            # 构建并运行
 
 ```console
 zphp script.php            # 运行脚本文件（寄存器字节码 VM）
-zphp --jit script.php     # 启用基线 JIT（实验性，见 docs/JIT_DESIGN.md）
-zphp --no-jit script.php   # 显式禁用 JIT（默认即关闭）
 zphp -r 'echo 1 + 2;'     # 执行内联代码
 zphp -v                    # 版本
 ```
@@ -149,7 +147,7 @@ vm.zig             寄存器式字节码虚拟机：每帧平坦寄存器文件�
 - [x] 接口 / trait / 静态成员（self::/parent::/static::、instanceof 传递）
 - [x] 16 字节紧凑值表示（字符串装箱为堆上头对象）
 - [x] float 科学计数法 + 非数值运算 TypeError（PHP 8 对齐）
-- [x] baseline JIT（x86-64，类型守卫 + 自动回退解释器，见 docs/JIT_DESIGN.md）
+- [x] 寄存器字节码 VM（含异常、引用、OOP 子集）
 - [ ] 与 PHP 对齐的 float 科学计数法格式
 
 ## License

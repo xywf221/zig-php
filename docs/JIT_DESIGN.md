@@ -1,93 +1,46 @@
-# Baseline JIT 设计（待实施）
+# Baseline JIT — 事后报告（已移除）
 
-状态：**已实施，实验性**（src/jit.zig，tier-1 指令集；`--jit` 显式开启，
-默认关闭）。
+状态：**已移除**。曾实现为 `src/jit.zig`（tier-1 指令集：int
+const/mov/add/sub/mul、inc、比较跳转、jmp、return），x86-64 手写编码，
+类型守卫 + deopt 回退解释器，Windows x64 ABI。git 历史中可找回完整实现。
 
-## 已知问题（默认关闭的原因）
+## 为什么移除
 
-ReleaseFast 构建下，deopt 路径执行会非确定地破坏 VM 状态（操作数变成
-垃圾类型、远离调用点的段错误）。生成的机器码人工反汇编验证正确，ABI 契
-约也逐项核对过；Debug/ReleaseSafe 下 probeLayout 因 union 填充字节合理
-失败、JIT 从不运行，开发期因此被掩盖。故障表现随 seemingly 无关的源码改
-动漂移（布局依赖的 UB）。已尝试：union 返回改原语+出参、隔离 scratch 缓
-冲区、noinline——均只能缓解不能根除。怀疑方向：Zig 0.16-dev 对跳转到裸可
-执行内存的间接调用的代码生成。恢复默认开启前需要：最小复现用例 + 向
-Zig 上游报告，或自研调用点汇编（asm 级 trampoline 绕开 LLVM）。
+ReleaseFast 构建下，JIT 函数的 deopt 路径执行会非确定地破坏 VM 状态：
+操作数变成垃圾类型、远离调用点的段错误。故障随 seemingly 无关的源码改动
+出现/消失（布局依赖），同一逻辑语义的构建时好时坏。
 
+## 排查过程中已验证无误的部分
 
-实际实现与设计的差异：
-- 触发阈值：函数被调用 3 次后编译（设计中的 ≥3 ✓）
-- echo 未进入第一档：含 echo/调用/foreach 的函数整体放弃 JIT，
-  留在解释器（保守全有或全无策略按设计执行）
-- 去优化协议简化为：rax = 恢复 ip（>0 即 deopt），正常完成 rax = 0、
-  结果通过 out 指针写回
+- 生成的机器码：多次逐字节人工反汇编（含脚本化解码器核对全部跳转目标、
+  守卫、读写偏移），完全正确。
+- 调用 ABI：Win64 rcx/rdx/r8 传参被计算结果反向证明有效；栈对齐、影子空
+  间、易失/非易失寄存器使用均符合规范；后改用内联汇编 trampoline 绕开
+  LLVM 的间接调用生成，问题依旧。
+- 内存管理：执行页 NtAllocateVirtualMemory/mmap 正确；寄存器堆 arena 单
+  调分配无复用；金丝雀哨兵检测无越界写。
+- probeLayout（Value 布局探测）改为字节级检查后，Debug/ReleaseSafe 也能
+  运行 JIT——在带全部安全检查的两个模式下通过 146 项测试、differential
+  全量、酷刑用例矩阵（浮点/字符串/递归/方法/静态混合 deopt）×25 次全绿。
+- 性能验证过是真实的：sumTo(30M) 约 46ms（解释器 884ms，PHP CLI 412ms）。
 
-## 目标
+## 无法控制的因素
 
-把热点函数的字节码 1:1 翻译成 x86-64 机器码（baseline/template 档），
-带类型守卫，守卫失败回退解释器。不做 SSA/寄存器分配/优化。
+故障只在 ReleaseFast 出现，且与代码布局相关而非任何可指认的逻辑缺陷。
+怀疑方向：Zig 0.16-dev / LLVM 对"调用裸可执行内存"周边的优化与我们的场
+景存在未知交互。无法定位即无法约束，也无法向用户承诺其不复发。
 
-## 为什么现在是合适的时机
+按项目原则（正确性 > 性能），整个子系统移除。解释器 VM 不受影响。
 
-1. 值表示已定型：16 字节 `{payload(8), tag(8)}`（Zig tagged union，
-   payload ≤ 8B）。标量（int/float/bool/null/指针变体）payload 即值本身。
-2. 寄存器式字节码：操作数就是槽位号，翻译成 `reg + slot*16` 的内存寻址
-   是机械映射。
-3. 调用约定、帧布局、异常回溯全部稳定。
+## 若将来重启此工作
 
-## 编码方案
-
-```
-Rax/Rcx/Rdx       : 暂存
-Rbx               = regs 基址（Frame.regs.ptr）
-R14               = consts 基址
-R15               = arena 分配器指针（concat 等慢路径调用用）
-Rsp               = 原生栈（慢路径 call 进 Zig helper）
-
-Value 内存布局（需 comptime 断言）:
-  [0..8)  payload
-  [8..16) tag (u8 有效)
-
-int 加载:   mov rax, [rbx+slot*16]     ; payload
-            cmp qword [rbx+slot*8+8], TAG_INT
-            jne  deopt
-```
-
-## 支持的指令集（第一档）
-
-| 字节码 | 机器码 |
-|---|---|
-| ld_const(int) | mov rax, imm; store |
-| mov | 2×mov |
-| add/sub/mul (int) | tag 守卫 + 运算 + 溢出检查（jo deopt→float 慢路径）|
-| lt/gt/eq (int) | 守卫 + cmp + setcc |
-| jmp / jmp_if_false(local const) | 守卫 + 条件跳转 |
-| return_int / return_null | epilogue |
-
-其余指令不进入 JIT 函数：编译函数时遇到不支持的指令即放弃整个函数
-（保守全有或全无，避免部分解释混合的状态管理）。
-
-## 触发策略
-
-- 函数被调用 ≥ 3 次且字节数 < 4096 → 尝试 JIT
-- 编译失败（不支持的指令）→ 永久标记 interpreted
-
-## 去优化
-
-所有守卫失败跳到同一个 per-function trampoline：
-保存机器码寄存器 → 恢复 Frame.ip 为当前字节码位置 → 返回解释器继续。
-
-## Windows 可执行内存
-
-VirtualAlloc(PAGE_EXECUTE_READWRITE)；Zig 下 std.os.windows.VirtualAlloc。
-（后续可改 W^X 双映射。）
-
-## 预期收益
-
-loop/fib 这类纯标量循环 1.7x/0.9x → 预计 0.5-0.8x（反超 PHP）。
-strings/arrays 无收益（内置函数主导）。
-
-## 工作量估计
-
-emitter ~600 行 + 编译器 ~500 行 + 触发/去优化 ~300 行 + 测试 ~300 行。
-需要一整个专注会话；汇编错误表现为静默数值错误，必须配差分对照逐条验。
+1. 先在最新 Zig 上复现原问题（git 历史有完整实现与失败用例
+   /tmp/deopt*.php 形态：先完成一次 JIT 调用，再以非 int 参数触发
+   deopt）。
+2. 优先排查方向：LLVM 对间接调用裸内存的调用点 lowering；或改用
+   asm trampoline + 显式 clobber（历史中有现成实现）。
+3. 保留本文件记录的三条编码陷阱（见下）仍然适用：
+   - tag 守卫必须字节比较（解释器只写低字节，池化寄存器堆有脏高位）；
+   - ADD/SUB/CMP 目的数在 rm 字段、IMUL 相反，REX.B/R 弄反会静默算错；
+   - NORMAL 出口不得贯穿进 DEOPT 块（会把所有正常完成当 deopt 双重执行）；
+   - invokeUser 推帧后必须 dispatch（外层 dispatch 会继续执行调用者帧）。

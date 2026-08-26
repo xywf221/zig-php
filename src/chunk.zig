@@ -74,10 +74,6 @@ pub const Func = struct {
     by_ref_params: []const bool = &.{},
     /// Owning class for methods (self:: resolution); null otherwise.
     cls_name: ?[]const u8 = null,
-    /// Baseline-JIT state (opaque *jit.Code when compiled).
-    jit_code: ?*anyopaque = null,
-    jit_runs: u8 = 0,
-    jit_failed: bool = false,
     /// Static method (no instance binding).
     is_static: bool = false,
     chunk: Chunk = .{},
