@@ -1027,16 +1027,19 @@ pub const Vm = struct {
         if (!jitmod.enabled or !jitmod.probe_ok) return .unavailable;
         if (callee.jit_failed) return .unavailable;
         if (callee.jit_code == null) {
-            if (callee.jit_runs >= 3) {
-                var jdiag = jitmod.Diag{};
-                if (jitmod.compile(self.arena, callee, &jdiag) catch null) |code| {
-                    callee.jit_code = code;
-                } else {
-                    callee.jit_failed = true;
-                    return .unavailable;
-                }
+            // Compile on first invocation: compilation cost (~µs) is trivial
+            // next to even one interpreted run of a hot loop, and one-shot
+            // heavy callers are exactly the workload worth catching.
+            var jdiag = jitmod.Diag{};
+            const maybe_code = jitmod.compile(self.arena, callee, &jdiag) catch {
+                callee.jit_failed = true;
+                return .unavailable;
+            };
+            if (maybe_code) |code| {
+                callee.jit_code = code;
             } else {
-                callee.jit_runs += 1;
+                callee.jit_failed = true;
+                _ = &jdiag;
                 return .unavailable;
             }
         }

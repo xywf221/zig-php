@@ -65,6 +65,37 @@ Key optimizations beyond the ISA switch itself:
 - Array performance beats the reference because ordered-dict operations map
   well onto an entry list with a next-index fast path.
 
+## JIT (baseline, tier-1)
+
+`src/jit.zig` compiles eligible user functions to native x86-64 on first
+invocation (Windows x64 ABI). Tier-1 op set: int const/mov/add/sub/mul,
+inc, int compare-and-branch, jmp, returns. Every potentially-failing check
+is guarded (tag-byte compares + overflow `jo`); a failed guard deopts by
+returning the bytecode resume-ip and the interpreter finishes the call.
+Compilation is all-or-nothing per function: one unsupported op (division,
+strings, calls...) bails to interpretation.
+
+Measured on this machine (ReleaseFast, microtime inside PHP):
+
+| workload | zphp --no-jit | zphp jit | php 8.5 |
+|---|---:|---:|---:|
+| sumTo(30M) — pure int accumulation | 948 ms | **44 ms** | 403 ms |
+
+i.e. ~21x over our interpreter, ~9x over PHP CLI for the tier-1 sweet spot.
+Whole-script effects are smaller because top-level code (`main`) is never
+JITed and mixed workloads bail on unsupported ops.
+
+Debug notes for future work:
+- Value layout is probed at runtime (payload/tag word order varies with
+  Zig's union layout); tag guards must be byte compares (`80 B9 disp8`)
+  because the interpreter only writes the low tag byte — pooled register
+  files leave stale high bytes.
+- ADD/SUB/CMP encode dest in rm field, src in reg field; IMUL r64,r/m64
+  is the reverse. Getting REX.B/R backwards silently corrupts results.
+- The normal-exit block must not fall through into the deopt-exit block;
+  that turned every completion into a spurious deopt (correct output,
+  double execution).
+
 ## Planned improvements
 
 1. Rope/string-builder representation for `.=` accumulation (strings).

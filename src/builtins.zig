@@ -46,6 +46,7 @@ const table = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "array_reverse", &fn_array_reverse },
     .{ "array_sum", &fn_array_sum },
     .{ "get_class", &fn_get_class },
+    .{ "microtime", &fn_microtime },
     .{ "array_merge", &fn_array_merge },
     .{ "in_array", &fn_in_array },
     .{ "implode", &fn_implode },
@@ -310,6 +311,28 @@ fn fn_sprintf(in: *Vm, args: []const Value) Error!Value {
 fn fn_get_class(in: *Vm, args: []const Value) Error!Value {
     if (args.len == 1 and args[0] == .obj_) return try mkStr(in, args[0].obj_.class_name);
     return .{ .bool_ = false }; // simplified: no class-scope form
+}
+
+fn fn_microtime(in: *Vm, args: []const Value) Error!Value {
+    _ = in;
+    _ = args;
+    // Wall-clock seconds since epoch via the Windows/POSIX clocks.
+    var secs: f64 = 0;
+    if (@import("builtin").os.tag == .windows) {
+        const win = std.os.windows;
+        const kernel32 = struct {
+            extern "kernel32" fn GetSystemTimeAsFileTime(lp: *win.FILETIME) callconv(.winapi) void;
+        };
+        var ft: win.FILETIME = undefined;
+        kernel32.GetSystemTimeAsFileTime(&ft);
+        const q: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        // FILETIME: 100ns intervals since 1601-01-01; epoch delta = 11644473600s
+        secs = @as(f64, @floatFromInt(q)) / 10_000_000.0 - 11644473600.0;
+    } else {
+        const ts = std.posix.clock_gettime(.REALTIME) catch return .{ .float_ = 0 };
+        secs = @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) / 1e9;
+    }
+    return .{ .float_ = secs };
 }
 
 fn fn_count(in: *Vm, args: []const Value) Error!Value {

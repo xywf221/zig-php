@@ -65,8 +65,8 @@ zig build run -- script.php            # 构建并运行
 ## 用法
 
 ```console
-zphp script.php            # 运行脚本文件（字节码 VM）
-zphp --tree script.php     # 使用树遍历参考引擎
+zphp script.php            # 运行脚本文件（寄存器字节码 VM）
+zphp --no-jit script.php   # 禁用 JIT（纯解释执行）
 zphp -r 'echo 1 + 2;'     # 执行内联代码
 zphp -v                    # 版本
 ```
