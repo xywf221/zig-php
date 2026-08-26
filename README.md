@@ -148,7 +148,7 @@ vm.zig             寄存器式字节码虚拟机：每帧平坦寄存器文件�
 - [x] 接口 / trait / 静态成员（self::/parent::/static::、instanceof 传递）
 - [x] 16 字节紧凑值表示（字符串装箱为堆上头对象）
 - [x] float 科学计数法 + 非数值运算 TypeError（PHP 8 对齐）
-- [ ] baseline JIT（设计已冻结：docs/JIT_DESIGN.md）
+- [x] baseline JIT（x86-64，类型守卫 + 自动回退解释器，见 docs/JIT_DESIGN.md）
 - [ ] 与 PHP 对齐的 float 科学计数法格式
 
 ## License

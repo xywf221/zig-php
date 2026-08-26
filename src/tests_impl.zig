@@ -297,6 +297,31 @@ test "array aliasing through reference" {
 }
 
 // ===========================================================================
+// Baseline JIT
+// ===========================================================================
+
+test "jitted functions compute identically (threshold = 3 calls)" {
+    // Called 10x -> compiled after the 3rd invocation; results must stay
+    // identical across interpreted warmup and JITed steady state.
+    try expectOut("function add($a, $b) { return $a + $b; } " ++
+        "$ok = 0;" ++
+        "for ($i = 0; $i < 10; $i++) { if (add($i, 100) === $i + 100) $ok++; } " ++
+        "echo $ok;", "10");
+}
+
+test "jitted loop with compare-branch and overflow-free arithmetic" {
+    try expectOut("function loopy($n) { $s = 0; for ($i = 0; $i < $n; $i++) { $s += $i; } return $s; } " ++
+        "echo loopy(5), '|', loopy(100), '|', loopy(100000);", "10|4950|4999950000");
+    try expectOut("function neg($a, $b) { $d = $a - $b * 2; if ($d < 0) { return -$d; } return $d; } " ++
+        "echo neg(1, 10), '|', neg(10, 1);", "19|8");
+}
+
+test "jit deopt on non-int input falls back to interpreter" {
+    try expectOut("function half($x) { return $x / 2; } " ++
+        "echo half(10), half(9), half('8');", "54.54");
+}
+
+// ===========================================================================
 // Interfaces / traits / static members
 // ===========================================================================
 
