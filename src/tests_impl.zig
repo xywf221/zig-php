@@ -299,8 +299,17 @@ test "array aliasing through reference" {
 // ===========================================================================
 // Baseline JIT
 // ===========================================================================
+// NOTE: the JIT is opt-in (--jit) and probeLayout only succeeds in some
+// optimize modes, so under a plain `zig build test` (Debug) these run
+// fully interpreted — they are regression guards for the shared contract,
+// not proof that native execution happened.
+
+fn enableJit() void {
+    @import("jit.zig").enabled = true;
+}
 
 test "jitted functions compute identically (threshold = 3 calls)" {
+    enableJit();
     // Called 10x -> compiled after the 3rd invocation; results must stay
     // identical across interpreted warmup and JITed steady state.
     try expectOut("function add($a, $b) { return $a + $b; } " ++
@@ -310,6 +319,7 @@ test "jitted functions compute identically (threshold = 3 calls)" {
 }
 
 test "jitted loop with compare-branch and overflow-free arithmetic" {
+    enableJit();
     try expectOut("function loopy($n) { $s = 0; for ($i = 0; $i < $n; $i++) { $s += $i; } return $s; } " ++
         "echo loopy(5), '|', loopy(100), '|', loopy(100000);", "10|4950|4999950000");
     try expectOut("function neg($a, $b) { $d = $a - $b * 2; if ($d < 0) { return -$d; } return $d; } " ++
@@ -317,6 +327,7 @@ test "jitted loop with compare-branch and overflow-free arithmetic" {
 }
 
 test "jit deopt on non-int input falls back to interpreter" {
+    enableJit();
     try expectOut("function half($x) { return $x / 2; } " ++
         "echo half(10), half(9), half('8');", "54.54");
 }

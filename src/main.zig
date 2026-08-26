@@ -32,7 +32,11 @@ pub fn main(init: std.process.Init) !u8 {
     var inline_code: ?[]const u8 = null;
 
     while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--no-jit")) {
+        if (std.mem.eql(u8, arg, "--jit")) {
+            // Baseline JIT is opt-in: see docs/JIT_DESIGN.md ("known issues")
+            // for why it is not enabled by default yet.
+            jitmod.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--no-jit")) {
             jitmod.enabled = false;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
             inline_code = args_it.next() orelse {

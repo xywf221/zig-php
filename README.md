@@ -66,7 +66,8 @@ zig build run -- script.php            # 构建并运行
 
 ```console
 zphp script.php            # 运行脚本文件（寄存器字节码 VM）
-zphp --no-jit script.php   # 禁用 JIT（纯解释执行）
+zphp --jit script.php     # 启用基线 JIT（实验性，见 docs/JIT_DESIGN.md）
+zphp --no-jit script.php   # 显式禁用 JIT（默认即关闭）
 zphp -r 'echo 1 + 2;'     # 执行内联代码
 zphp -v                    # 版本
 ```

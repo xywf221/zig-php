@@ -30,7 +30,7 @@ const Value = valmod.Value;
 
 pub const max_jit_bytes: usize = 4096;
 
-pub var enabled: bool = true;
+pub var enabled: bool = false;
 pub var probe_ok: bool = false;
 var tag_int: u8 = 0;
 var tag_null: u8 = 0;
@@ -73,7 +73,7 @@ pub const Code = struct {
 
     /// Execute the JITed body. Returns deopt resume ip or 0 on normal
     /// completion (result written to *out).
-    pub fn run(self: *Code, regs: [*]Value, out: *Value, vm: *anyopaque) u64 {
+    pub noinline fn run(self: *Code, regs: [*]Value, out: *Value, vm: *anyopaque) u64 {
         const FnTy = *const fn (regs: [*]Value, out: *Value, vm: *anyopaque) callconv(.c) u64;
         const f: FnTy = @ptrCast(@alignCast(self.mem.ptr));
         return f(regs, out, vm);

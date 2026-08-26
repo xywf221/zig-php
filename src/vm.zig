@@ -964,29 +964,27 @@ pub const Vm = struct {
             }
 
             // Baseline JIT fast path (same contract as invokeUser's).
-            switch (self.tryRunJit(callee, callee_regs)) {
-                .completed => |out| {
-                    caller.regs[base_reg] = out;
+            var jit_out: Value = .null_;
+            if (self.tryRunJit(callee, callee_regs, &jit_out)) |resume_ip| {
+                if (resume_ip == 0) {
+                    caller.regs[base_reg] = jit_out;
                     return;
-                },
-                .deopt => |resume_ip| {
-                    try self.frames.append(self.arena, .{
-                        .func = callee,
-                        .ip = resume_ip,
-                        .regs = callee_regs,
-                        .hidden = try self.arena.alloc(Value, callee.nhidden),
-                        .result_reg = base_reg,
-                    });
-                },
-                .unavailable => {
-                    try self.frames.append(self.arena, .{
-                        .func = callee,
-                        .ip = 0,
-                        .regs = callee_regs,
-                        .hidden = try self.arena.alloc(Value, callee.nhidden),
-                        .result_reg = base_reg, // written back into caller's registers
-                    });
-                },
+                }
+                try self.frames.append(self.arena, .{
+                    .func = callee,
+                    .ip = resume_ip,
+                    .regs = callee_regs,
+                    .hidden = try self.arena.alloc(Value, callee.nhidden),
+                    .result_reg = base_reg,
+                });
+            } else {
+                try self.frames.append(self.arena, .{
+                    .func = callee,
+                    .ip = 0,
+                    .regs = callee_regs,
+                    .hidden = try self.arena.alloc(Value, callee.nhidden),
+                    .result_reg = base_reg, // written back into caller's registers
+                });
             }
 
             // Execute callee to completion; depth bounded by MAX_CALL_DEPTH.
@@ -1018,14 +1016,19 @@ pub const Vm = struct {
         return self.fatalF(line, "Call to undefined function {s}()", .{name});
     }
 
-    /// Run `callee` through the baseline JIT if eligible. Returns
-    /// .completed with the result, or .deopt with the bytecode ip to resume
-    /// interpretation from. Caller must NOT have pushed the frame yet.
-    const JitOutcome = union(enum) { completed: Value, deopt: u32, unavailable };
-
-    fn tryRunJit(self: *Vm, callee: *Func, callee_regs: []Value) JitOutcome {
-        if (!jitmod.enabled or !jitmod.probe_ok) return .unavailable;
-        if (callee.jit_failed) return .unavailable;
+    /// Run `callee` through the baseline JIT if eligible.
+    ///
+    /// Returns null = JIT unavailable (caller pushes a fresh frame),
+    /// otherwise the deopt resume bytecode ip — where 0 means "completed",
+    /// with the result written through `out_completed`.
+    ///
+    /// NOTE: deliberately returns primitives + out-param instead of a
+    /// tagged union containing a 16-byte Value. The union-by-value form
+    /// miscompiles under ReleaseFast/Win64 (payload reinterpreted as a
+    /// pointer/vtable pair -> segfault on the deopt path).
+    fn tryRunJit(self: *Vm, callee: *Func, callee_regs: []Value, out_completed: *Value) ?u32 {
+        if (!jitmod.enabled or !jitmod.probe_ok) return null;
+        if (callee.jit_failed) return null;
         if (callee.jit_code == null) {
             // Compile on first invocation: compilation cost (~µs) is trivial
             // next to even one interpreted run of a hot loop, and one-shot
@@ -1033,21 +1036,26 @@ pub const Vm = struct {
             var jdiag = jitmod.Diag{};
             const maybe_code = jitmod.compile(self.arena, callee, &jdiag) catch {
                 callee.jit_failed = true;
-                return .unavailable;
+                return null;
             };
             if (maybe_code) |code| {
                 callee.jit_code = code;
             } else {
                 callee.jit_failed = true;
                 _ = &jdiag;
-                return .unavailable;
+                return null;
             }
         }
         const code: *jitmod.Code = @ptrCast(@alignCast(callee.jit_code.?));
+        // TEMP-C: run target is a LOCAL of tryRunJit again (like the union
+        // version), copied out through the out-param afterwards.
         var out: Value = .null_;
         const rip = code.run(callee_regs.ptr, &out, self);
-        if (rip == 0) return .{ .completed = out };
-        return .{ .deopt = @intCast(rip) };
+        if (rip == 0) {
+            out_completed.* = out;
+            return 0; // completed
+        }
+        return @intCast(rip); // deopt resume ip
     }
 
     /// Invoke a compiled method/function: `this_obj` lands in callee slot 0
@@ -1191,42 +1199,42 @@ pub const Vm = struct {
         }
         // Baseline JIT fast path: run without pushing a frame; on deopt,
         // resume interpretation from the returned bytecode ip.
-        switch (self.tryRunJit(callee, callee_regs)) {
-            .completed => |out| {
-                if (result_dst != opcode.no_reg) caller.regs[result_dst] = out;
+        //
+        // NOTE: keep structurally parallel to doCall's JIT block.
+        var jit_out: Value = .null_;
+        if (self.tryRunJit(callee, callee_regs, &jit_out)) |resume_ip| {
+            if (resume_ip == 0) {
+                if (result_dst != opcode.no_reg) caller.regs[result_dst] = jit_out;
                 return;
-            },
-            .deopt => |resume_ip| {
-                try self.frames.append(self.arena, .{
-                    .func = callee,
-                    .ip = resume_ip,
-                    .regs = callee_regs,
-                    .hidden = try self.arena.alloc(Value, callee.nhidden),
-                    .result_reg = result_dst,
-                });
-            },
-            .unavailable => {
-                try self.frames.append(self.arena, .{
-                    .func = callee,
-                    .ip = 0,
-                    .regs = callee_regs,
-                    .hidden = try self.arena.alloc(Value, callee.nhidden),
-                    .result_reg = result_dst,
-                });
-                if (self.dispatch()) |_| {
+            }
+            try self.frames.append(self.arena, .{
+                .func = callee,
+                .ip = resume_ip,
+                .regs = callee_regs,
+                .hidden = try self.arena.alloc(Value, callee.nhidden),
+                .result_reg = result_dst,
+            });
+        } else {
+            try self.frames.append(self.arena, .{
+                .func = callee,
+                .ip = 0,
+                .regs = callee_regs,
+                .hidden = try self.arena.alloc(Value, callee.nhidden),
+                .result_reg = result_dst,
+            });
+        }
+        if (self.dispatch()) |_| {
+            return;
+        } else |e| switch (e) {
+            error.Thrown => {
+                _ = self.frames.pop(); // discard aborted callee
+                if (self.unwindToRegion()) |handler_ip| {
+                    self.frames.items[self.frames.items.len - 1].ip = handler_ip;
                     return;
-                } else |e| switch (e) {
-                    error.Thrown => {
-                        _ = self.frames.pop();
-                        if (self.unwindToRegion()) |handler_ip| {
-                            self.frames.items[self.frames.items.len - 1].ip = handler_ip;
-                            return;
-                        }
-                        return e;
-                    },
-                    else => return e,
                 }
+                return e;
             },
+            else => return e,
         }
     }
 
